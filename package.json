@@ -1,0 +1,24 @@
+{
+  "name": "harshal-mcp-proxy",
+  "version": "1.0.0",
+  "description": "Custom MCP gateway with schema deferral + response shielding. Combines mcp-gateway's search→describe→invoke pattern with tldr's response truncation and result store.",
+  "type": "module",
+  "bin": {
+    "harshal-mcp-proxy": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "node --loader ts-node/esm src/index.ts",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.10.1",
+    "minisearch": "^7.1.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.5",
+    "@types/node": "^20.12.0",
+    "ts-node": "^10.9.2"
+  }
+}
