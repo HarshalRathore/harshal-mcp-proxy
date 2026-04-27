@@ -18,6 +18,8 @@ export declare class SearchEngine {
     private miniSearch;
     /** Dirty flag: set true when catalog changes, triggers rebuild on next search */
     private indexDirty;
+    /** Cache for describe results — eliminates repeated schema lookups */
+    private describeCache;
     constructor();
     /** Register a tool into the catalog. Marks index dirty. */
     addTool(tool: ToolCatalogEntry): void;
@@ -27,6 +29,8 @@ export declare class SearchEngine {
     getTools(): ToolCatalogEntry[];
     /** Get a single catalog entry by composite ID */
     getTool(id: string): ToolCatalogEntry | undefined;
+    /** Get a catalog entry with caching — use for describe to avoid repeated lookups */
+    getSchema(id: string): ToolCatalogEntry | undefined;
     /**
      * Search the catalog using BM25 scoring.
      *

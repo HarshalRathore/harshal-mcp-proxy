@@ -32,4 +32,17 @@ import { ResponseStore, ResponseShield } from "./response-store.js";
  * @param responseShield - Truncation engine for response shielding
  * @returns Configured McpServer ready to connect to a transport
  */
-export declare function createServer(searchEngine: SearchEngine, connections: ConnectionManager, jobManager: JobManager, responseStore: ResponseStore, responseShield: ResponseShield): McpServer;
+export declare function createServer(searchEngine: SearchEngine, connections: ConnectionManager, jobManager: JobManager, responseStore: ResponseStore, responseShield: ResponseShield, projectRegistry?: import("./projectRegistry.js").ProjectRegistry, statusHolder?: StatusHolder): McpServer;
+export interface StatusHolder {
+    getConnectedServers: () => string[];
+    getToolCount: (server: string) => number;
+    getTotalTools: () => number;
+    getConfigPath: () => string;
+    getLastReloadTimestamp: () => number;
+    isPendingReload: () => boolean;
+    getProjects: () => Array<{
+        name: string;
+        path: string;
+    }>;
+    getDefaultProject: () => string | null;
+}

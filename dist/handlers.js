@@ -29,19 +29,18 @@ import { z } from "zod";
  * @param responseShield - Truncation engine for response shielding
  * @returns Configured McpServer ready to connect to a transport
  */
-export function createServer(searchEngine, connections, jobManager, responseStore, responseShield) {
+export function createServer(searchEngine, connections, jobManager, responseStore, responseShield, projectRegistry, statusHolder) {
     const server = new McpServer({ name: "harshal-mcp-proxy", version: "1.0.0" }, { capabilities: { tools: {} } });
     // ─────────────────────────────────────────
     // Tool 1: gateway.search
     // ─────────────────────────────────────────
     // The model's entry point. Search by natural language query.
-    // Returns tool IDs + descriptions + scores — NO schemas.
+    // Returns tool IDs + descriptions + scores + fieldNames — NO full schemas.
     // This alone saves thousands of tokens per interaction.
     server.registerTool("gateway.search", {
         title: "Search MCP Tools",
         description: "Search for tools across all connected MCP servers using BM25 scoring with fuzzy matching. " +
-            "Returns tool IDs, names, descriptions, and relevance scores — NOT full schemas. " +
-            "Use gateway.describe to get the full input schema for a specific tool before invoking it. " +
+            "Returns tool IDs, names, displayNames, fieldNames, descriptions, and relevance scores — NOT full schemas. " +
             "An empty query returns all available tools.",
         inputSchema: {
             query: z.string().describe("Search query (natural language, e.g. 'run cypher query' or 'navigate browser')"),
@@ -64,10 +63,12 @@ export function createServer(searchEngine, connections, jobManager, responseStor
                         results: results.map((r) => ({
                             id: r.id,
                             name: r.name,
+                            displayName: r.displayName,
                             server: r.server,
                             description: r.description
                                 ? r.description.slice(0, 120) + (r.description.length > 120 ? "..." : "")
                                 : undefined,
+                            fieldNames: r.fieldNames,
                             score: Math.round(r.score * 100) / 100,
                         })),
                     }, null, 2),
@@ -79,18 +80,17 @@ export function createServer(searchEngine, connections, jobManager, responseStor
     // Tool 2: gateway.describe
     // ─────────────────────────────────────────
     // Returns the FULL tool schema (inputSchema) for one specific tool.
-    // This is the "deferred" schema load — only fetched when the model
-    // actually needs to call a tool.
+    // Uses a cache so repeated calls are instant lookups.
     server.registerTool("gateway.describe", {
         title: "Describe MCP Tool",
         description: "Get full details for a specific tool including its complete input schema. " +
             "Use the tool ID from gateway.search results (format: serverKey::toolName). " +
-            "You MUST call this before gateway.invoke to know the correct argument format.",
+            "Most tools return fieldNames in search results — describe is only needed for full schema detail.",
         inputSchema: {
             id: z.string().describe("Tool ID from search results (e.g. 'neo4j-cypher::run_cypher_query')"),
         },
     }, async ({ id }) => {
-        const tool = searchEngine.getTool(id);
+        const tool = searchEngine.getSchema(id);
         if (!tool) {
             return {
                 content: [{ type: "text", text: `ERROR: Tool not found: ${id}` }],
@@ -157,10 +157,19 @@ export function createServer(searchEngine, connections, jobManager, responseStor
             };
         }
         try {
+            // Auto-inject projectPath for codegraph tools
+            let finalArgs = args;
+            if (serverKey === "codegraph" && projectRegistry) {
+                if (!("projectPath" in (args || {}))) {
+                    const resolved = projectRegistry.resolveProjectPath();
+                    if (resolved)
+                        finalArgs = { ...finalArgs, projectPath: resolved };
+                }
+            }
             // Call the upstream tool with timeout
             const timeout = timeoutMs || 60_000;
             const result = await Promise.race([
-                client.callTool({ name: toolName, arguments: args }),
+                client.callTool({ name: toolName, arguments: finalArgs }),
                 new Promise((_, reject) => setTimeout(() => reject(new Error(`TIMEOUT: Tool ${id} exceeded ${timeout}ms`)), timeout)),
             ]);
             // ── Response Shielding ──
@@ -293,6 +302,44 @@ export function createServer(searchEngine, connections, jobManager, responseStor
             ],
         };
     });
+    // Register gateway.status tool if statusHolder provided
+    if (statusHolder) {
+        registerStatusTool(server, statusHolder);
+    }
     return server;
+}
+/**
+ * Create the gateway.status tool.
+ * Returns current gateway state including servers, tools, config, and reload status.
+ */
+function registerStatusTool(server, statusHolder) {
+    server.registerTool("gateway.status", {
+        title: "Get Gateway Status",
+        description: "Returns the current status of the gateway including connected servers, " +
+            "tool counts, config file path, last reload timestamp, pending reload status, " +
+            "and available codegraph projects. Use this to check if config reloaded after changes.",
+        inputSchema: {},
+    }, async () => {
+        const connectedServers = statusHolder.getConnectedServers();
+        return {
+            content: [
+                {
+                    type: "text",
+                    text: JSON.stringify({
+                        connectedServers: connectedServers.map((name) => ({
+                            name,
+                            toolCount: statusHolder.getToolCount(name),
+                        })),
+                        totalTools: statusHolder.getTotalTools(),
+                        configPath: statusHolder.getConfigPath(),
+                        lastReloadTimestamp: statusHolder.getLastReloadTimestamp(),
+                        pendingReload: statusHolder.isPendingReload(),
+                        codegraphProjects: statusHolder.getProjects(),
+                        defaultProject: statusHolder.getDefaultProject(),
+                    }, null, 2),
+                },
+            ],
+        };
+    });
 }
 //# sourceMappingURL=handlers.js.map

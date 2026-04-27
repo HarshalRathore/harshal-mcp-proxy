@@ -24,6 +24,7 @@ import { JobManager } from "./jobs.js";
 import { ConnectionManager } from "./connections.js";
 import { ResponseStore, ResponseShield } from "./response-store.js";
 import { createServer } from "./handlers.js";
+import { ProjectRegistry } from "./projectRegistry.js";
 export class MCPGateway {
     config;
     searchEngine;
@@ -31,6 +32,10 @@ export class MCPGateway {
     connections;
     responseStore;
     responseShield;
+    projectRegistry;
+    statusHolder;
+    lastReloadTimestamp = Date.now();
+    pendingReload = false;
     server;
     constructor(configPath) {
         // Initialize all subsystems
@@ -40,8 +45,32 @@ export class MCPGateway {
         this.connections = new ConnectionManager(this.searchEngine);
         this.responseStore = new ResponseStore();
         this.responseShield = new ResponseShield(this.responseStore);
-        // Create the MCP server with all 6 gateway tools
-        this.server = createServer(this.searchEngine, this.connections, this.jobManager, this.responseStore, this.responseShield);
+        // Initialize project registry with scan roots from config or env
+        // SCAN_ROOTS env var: comma-separated list of directories to scan for .codegraph/ folders
+        // Default: scan the current working directory
+        const envScanRoots = process.env.SCAN_ROOTS || "";
+        const scanRoots = envScanRoots
+            ? envScanRoots.split(",").map((s) => s.trim()).filter(Boolean)
+            : [process.cwd()];
+        const configCodegraph = this.config.get("codegraph");
+        const explicitProjects = configCodegraph?.projects || [];
+        const allScanRoots = [...scanRoots, ...explicitProjects.map((p) => p.path)];
+        this.projectRegistry = new ProjectRegistry(allScanRoots);
+        const configDefault = configCodegraph?.defaultProject;
+        this.projectRegistry.discover(configDefault);
+        // Create the MCP server with all gateway tools, passing projectRegistry + status
+        const statusHolder = {
+            getConnectedServers: () => this.connections.getConnectedServers(),
+            getToolCount: (server) => this.searchEngine.getTools().filter((t) => t.server === server).length,
+            getTotalTools: () => this.searchEngine.getTools().length,
+            getConfigPath: () => this.config.getPath(),
+            getLastReloadTimestamp: () => this.lastReloadTimestamp,
+            isPendingReload: () => this.pendingReload,
+            getProjects: () => this.projectRegistry.projectsList,
+            getDefaultProject: () => this.projectRegistry.defaultProjectName,
+        };
+        this.statusHolder = statusHolder;
+        this.server = createServer(this.searchEngine, this.connections, this.jobManager, this.responseStore, this.responseShield, this.projectRegistry, statusHolder);
         // Wire up the job manager's execute function
         // This is called when an async job is dequeued
         this.jobManager.setExecuteJob(async (job) => {
@@ -51,17 +80,45 @@ export class MCPGateway {
             }
             const serverKey = job.toolId.toString().slice(0, separatorIndex);
             const toolName = job.toolId.toString().slice(separatorIndex + 2);
-            const client = this.connections.getClient(serverKey);
+            let client = this.connections.getClient(serverKey);
+            if (!client) {
+                // Attempt reconnection for this server
+                const serverConfig = this.config.get(serverKey);
+                if (serverConfig) {
+                    try {
+                        await this.connections.connectWithRetry(serverKey, serverConfig, 3, 1000);
+                        client = this.connections.getClient(serverKey);
+                    }
+                    catch {
+                        // Reconnect failed
+                    }
+                }
+            }
             if (!client)
                 throw new Error(`Server not connected: ${serverKey}`);
+            // Auto-inject projectPath for codegraph tools
+            let finalArgs = job.args;
+            if (serverKey === "codegraph" && finalArgs) {
+                finalArgs = this.injectProjectPath(finalArgs);
+            }
             const result = await client.callTool({
                 name: toolName,
-                arguments: job.args,
+                arguments: finalArgs,
             });
             // Shield the async result too
             const { shielded, ref } = this.responseShield.shield(job.toolId.toString(), result);
             job.result = ref ? { ...shielded, _ref: ref } : shielded;
         });
+    }
+    /** Auto-inject projectPath for codegraph tools if not provided */
+    injectProjectPath(args) {
+        if ("projectPath" in args)
+            return args;
+        const resolved = this.projectRegistry.resolveProjectPath();
+        if (resolved) {
+            return { ...args, projectPath: resolved };
+        }
+        return args;
     }
     /**
      * Connect to all enabled upstream servers.
@@ -111,6 +168,7 @@ export class MCPGateway {
      * Uses a 1-second debounce to avoid thrashing on rapid saves.
      */
     handleConfigChange(oldConfig, newConfig) {
+        this.pendingReload = true;
         console.error("  [gateway] Config change detected, reloading...");
         const oldKeys = new Set(Object.keys(oldConfig));
         const newKeys = new Set(Object.keys(newConfig));
@@ -174,8 +232,26 @@ export class MCPGateway {
                 }
             }
             this.searchEngine.warmup();
+            this.pendingReload = false;
+            this.lastReloadTimestamp = Date.now();
             console.error(`  [gateway] Reloaded: ${this.searchEngine.getTools().length} tools from ${this.connections.getConnectedServers().length} servers`);
         }, 1000);
+    }
+    /**
+     * Share internal services for HTTP daemon mode.
+     * The HttpMcpServer reuses the same SearchEngine, ConnectionManager, etc.
+     * so that all clients share one set of upstream MCP connections.
+     */
+    getSharedServices() {
+        return {
+            searchEngine: this.searchEngine,
+            connections: this.connections,
+            jobManager: this.jobManager,
+            responseStore: this.responseStore,
+            responseShield: this.responseShield,
+            projectRegistry: this.projectRegistry,
+            statusHolder: this.statusHolder,
+        };
     }
     /** Graceful shutdown — stop watching, drain jobs, disconnect all */
     async shutdown() {

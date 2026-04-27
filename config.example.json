@@ -1,0 +1,110 @@
+{
+  "_note": "Copy this file to config.json and fill in your own values. This file is safe to commit.",
+  "repeato-backend-mcp-server": {
+    "type": "local",
+    "command": [
+      "npx",
+      "-y",
+      "reloaderoo",
+      "proxy",
+      "--",
+      "node",
+      "/path/to/your/backend/mcp-server/index.js"
+    ],
+    "enabled": false
+  },
+  "context7": {
+    "type": "local",
+    "command": [
+      "npx",
+      "-y",
+      "@upstash/context7-mcp",
+      "--api-key",
+      "ctx7sk-your-api-key-here"
+    ],
+    "enabled": false
+  },
+  "next-devtools": {
+    "type": "local",
+    "command": ["npx", "-y", "next-devtools-mcp@latest"]
+  },
+  "radix-ui": {
+    "type": "local",
+    "command": ["npx", "-y", "@gianpieropuleo/radix-mcp-server@latest"]
+  },
+  "stackoverflow": {
+    "type": "local",
+    "command": [
+      "npx",
+      "-y",
+      "@notalk-tech/stackoverflow-mcp",
+      "--api-key",
+      "your-stackoverflow-api-key"
+    ],
+    "enabled": false
+  },
+  "lucide-icons": {
+    "type": "local",
+    "command": ["npx", "lucide-icons-mcp", "--stdio"]
+  },
+  "shadcn": {
+    "type": "local",
+    "command": ["npx", "shadcn@latest", "mcp"]
+  },
+  "sequential-thinking": {
+    "type": "local",
+    "command": ["npx", "-y", "@modelcontextprotocol/server-sequential-thinking"]
+  },
+  "playwright": {
+    "type": "local",
+    "command": ["npx", "@playwright/mcp@latest", "--extension"],
+    "environment": {
+      "PLAYWRIGHT_MCP_EXTENSION_TOKEN": "your-token-here"
+    }
+  },
+  "tavily-remote-mcp": {
+    "type": "local",
+    "command": [
+      "npx",
+      "-y",
+      "mcp-remote",
+      "https://mcp.tavily.com/mcp/?tavilyApiKey=your-tavily-api-key"
+    ]
+  },
+  "neo4j-memory": {
+    "type": "local",
+    "command": ["npx", "-y", "@knowall-ai/mcp-neo4j-agent-memory"],
+    "environment": {
+      "NEO4J_URI": "neo4j+s://your-neo4j-instance.databases.neo4j.io",
+      "NEO4J_USERNAME": "your-username",
+      "NEO4J_PASSWORD": "{env:NEO4J_PASSWORD}",
+      "NEO4J_DATABASE": "your-database"
+    }
+  },
+  "neo4j-cypher": {
+    "type": "local",
+    "command": ["npx", "-y", "@alanse/mcp-neo4j-server@latest"],
+    "environment": {
+      "NEO4J_URI": "neo4j+s://your-neo4j-instance.databases.neo4j.io",
+      "NEO4J_USERNAME": "your-username",
+      "NEO4J_PASSWORD": "{env:NEO4J_PASSWORD}",
+      "NEO4J_DATABASE": "your-database"
+    }
+  },
+  "searxng": {
+    "type": "local",
+    "command": ["npx", "-y", "mcp-searxng"],
+    "environment": {
+      "SEARXNG_URL": "http://localhost:8085"
+    }
+  },
+  "codegraph": {
+    "type": "local",
+    "command": ["npx", "-y", "codegraph", "serve", "--mcp"]
+  },
+  "code-intel": {
+    "type": "remote",
+    "url": "http://127.0.0.1:3001/mcp",
+    "transport": "streamable_http"
+  }
+}

@@ -17,6 +17,11 @@
  * This means opencode won't hang waiting for slow servers to connect.
  * Tools become available in the search index as each server connects.
  */
+import { SearchEngine } from "./search.js";
+import { JobManager } from "./jobs.js";
+import { ConnectionManager } from "./connections.js";
+import { ResponseStore, ResponseShield } from "./response-store.js";
+import { ProjectRegistry } from "./projectRegistry.js";
 export declare class MCPGateway {
     private config;
     private searchEngine;
@@ -24,8 +29,14 @@ export declare class MCPGateway {
     private connections;
     private responseStore;
     private responseShield;
+    private projectRegistry;
+    private statusHolder;
+    private lastReloadTimestamp;
+    private pendingReload;
     private server;
     constructor(configPath?: string);
+    /** Auto-inject projectPath for codegraph tools if not provided */
+    private injectProjectPath;
     /**
      * Connect to all enabled upstream servers.
      * Uses Promise.allSettled so one failing server doesn't block others.
@@ -48,6 +59,20 @@ export declare class MCPGateway {
      * Uses a 1-second debounce to avoid thrashing on rapid saves.
      */
     private handleConfigChange;
+    /**
+     * Share internal services for HTTP daemon mode.
+     * The HttpMcpServer reuses the same SearchEngine, ConnectionManager, etc.
+     * so that all clients share one set of upstream MCP connections.
+     */
+    getSharedServices(): {
+        searchEngine: SearchEngine;
+        connections: ConnectionManager;
+        jobManager: JobManager;
+        responseStore: ResponseStore;
+        responseShield: ResponseShield;
+        projectRegistry: ProjectRegistry;
+        statusHolder: import("./handlers.js").StatusHolder;
+    };
     /** Graceful shutdown — stop watching, drain jobs, disconnect all */
     shutdown(): Promise<void>;
 }

@@ -199,7 +199,7 @@ export class ConnectionManager {
     throw lastError;
   }
 
-  /** Get a connected Client by server key (for invoking tools) */
+  /** Get a connected Client by server key (for invoking tools). */
   getClient(serverKey: string): Client | undefined {
     return this.upstreams.get(serverKey);
   }

@@ -62,7 +62,7 @@ export declare class ConnectionManager {
      * 5 attempts: 1s, 2s, 4s, 8s, 16s before giving up.
      */
     connectWithRetry(serverKey: string, config: UpstreamConfig, maxRetries?: number, baseDelay?: number): Promise<void>;
-    /** Get a connected Client by server key (for invoking tools) */
+    /** Get a connected Client by server key (for invoking tools). */
     getClient(serverKey: string): Client | undefined;
     /** Disconnect a single server and remove its tools from the catalog */
     disconnect(serverKey: string): Promise<void>;

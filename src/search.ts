@@ -14,6 +14,30 @@
 import MiniSearch from "minisearch";
 import type { ToolCatalogEntry, SearchFilters, SearchResult } from "./types.js";
 
+function toCamelCase(str: string): string {
+  return str.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
+}
+
+function extractFieldNames(schema: unknown): string[] {
+  if (!schema || typeof schema !== "object") return [];
+  const obj = schema as Record<string, unknown>;
+  if (obj.type === "object" && obj.properties && typeof obj.properties === "object") {
+    return Object.keys(obj.properties as Record<string, unknown>);
+  }
+  if (typeof obj.shape === "function") {
+    try {
+      const shape = (obj.shape as () => Record<string, unknown>)();
+      return Object.keys(shape);
+    } catch {
+      return [];
+    }
+  }
+  if (obj.inputSchema && typeof obj.inputSchema === "object") {
+    return extractFieldNames(obj.inputSchema);
+  }
+  return [];
+}
+
 export class SearchEngine {
   /** Full tool catalog keyed by composite ID */
   private catalog: Map<string, ToolCatalogEntry> = new Map();
@@ -23,6 +47,9 @@ export class SearchEngine {
 
   /** Dirty flag: set true when catalog changes, triggers rebuild on next search */
   private indexDirty = true;
+
+  /** Cache for describe results — eliminates repeated schema lookups */
+  private describeCache: Map<string, ToolCatalogEntry> = new Map();
 
   constructor() {}
 
@@ -48,6 +75,14 @@ export class SearchEngine {
     return this.catalog.get(id);
   }
 
+  /** Get a catalog entry with caching — use for describe to avoid repeated lookups */
+  getSchema(id: string): ToolCatalogEntry | undefined {
+    if (this.describeCache.has(id)) return this.describeCache.get(id);
+    const tool = this.catalog.get(id);
+    if (tool) this.describeCache.set(id, tool);
+    return tool;
+  }
+
   /**
    * Search the catalog using BM25 scoring.
    *
@@ -69,6 +104,8 @@ export class SearchEngine {
             id: t.id,
             server: t.server,
             name: t.name,
+            displayName: toCamelCase(t.name),
+            fieldNames: extractFieldNames(t.inputSchema),
             description: t.description,
             score: 0,
           }));
@@ -86,13 +123,19 @@ export class SearchEngine {
         if (filters.server && result.server !== filters.server) return false;
         return true;
       })
-      .map((result) => ({
-        id: result.id as string,
-        server: result.server as string,
-        name: result.name as string,
-        description: result.description as string | undefined,
-        score: result.score || 0,
-      }))
+      .map((result) => {
+        const id = result.id as string;
+        const catalogEntry = this.catalog.get(id);
+        return {
+          id,
+          server: result.server as string,
+          name: result.name as string,
+          displayName: toCamelCase(result.name as string),
+          fieldNames: catalogEntry ? extractFieldNames(catalogEntry.inputSchema) : [],
+          description: result.description as string | undefined,
+          score: result.score || 0,
+        };
+      })
       .sort((a, b) => b.score - a.score)
       .slice(0, maxLimit);
   }
@@ -108,6 +151,7 @@ export class SearchEngine {
    */
   private ensureIndex(): void {
     if (!this.indexDirty && this.miniSearch) return;
+    this.indexDirty = false;
 
     const tools = Array.from(this.catalog.values());
 
@@ -123,8 +167,6 @@ export class SearchEngine {
 
       // Fields stored in the index (returned with results, avoids catalog lookup)
       storeFields: ["id", "server", "name", "title", "description"],
-      // NOTE: inputSchema is intentionally NOT stored here — that's the whole point
-      // of schema deferral. It only comes back via gateway.describe.
 
       searchOptions: {
         boost: { name: 3, title: 2 },  // Tool name is strongest signal

@@ -1,0 +1,17 @@
+[Unit]
+Description=harshal-mcp-proxy daemon — shared MCP gateway for AI coding agents
+Documentation=https://github.com/your-org/harshal-mcp-proxy
+After=network.target
+
+[Service]
+Type=simple
+# ⚠️ UPDATE THIS PATH to match your installation directory
+ExecStart=/usr/bin/node /path/to/harshal-mcp-proxy/dist/index.js --daemon /home/username/.config/harshal-mcp-proxy/config.json
+Restart=on-failure
+RestartSec=5
+Environment=NODE_ENV=production
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

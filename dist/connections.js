@@ -164,7 +164,7 @@ export class ConnectionManager {
         console.error(`  [${serverKey}] All ${maxRetries} connection attempts failed`);
         throw lastError;
     }
-    /** Get a connected Client by server key (for invoking tools) */
+    /** Get a connected Client by server key (for invoking tools). */
     getClient(serverKey) {
         return this.upstreams.get(serverKey);
     }

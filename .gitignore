@@ -95,3 +95,17 @@ google-services.json
 
 # MCP server (local dev tooling)
 /mcp-server/
+
+# ===========================
+# Secrets (DO NOT COMMIT)
+# ===========================
+config.json
+.env
+.env.local
+.env.*
+
+# Personal IDE files
+.claude*
+.codegraph/
+.playwright-mcp/
+login-page.png

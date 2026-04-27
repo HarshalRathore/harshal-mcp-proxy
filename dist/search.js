@@ -11,6 +11,30 @@
  * and only gets back IDs + descriptions, never full JSON Schemas.
  */
 import MiniSearch from "minisearch";
+function toCamelCase(str) {
+    return str.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
+}
+function extractFieldNames(schema) {
+    if (!schema || typeof schema !== "object")
+        return [];
+    const obj = schema;
+    if (obj.type === "object" && obj.properties && typeof obj.properties === "object") {
+        return Object.keys(obj.properties);
+    }
+    if (typeof obj.shape === "function") {
+        try {
+            const shape = obj.shape();
+            return Object.keys(shape);
+        }
+        catch {
+            return [];
+        }
+    }
+    if (obj.inputSchema && typeof obj.inputSchema === "object") {
+        return extractFieldNames(obj.inputSchema);
+    }
+    return [];
+}
 export class SearchEngine {
     /** Full tool catalog keyed by composite ID */
     catalog = new Map();
@@ -18,6 +42,8 @@ export class SearchEngine {
     miniSearch = null;
     /** Dirty flag: set true when catalog changes, triggers rebuild on next search */
     indexDirty = true;
+    /** Cache for describe results — eliminates repeated schema lookups */
+    describeCache = new Map();
     constructor() { }
     /** Register a tool into the catalog. Marks index dirty. */
     addTool(tool) {
@@ -36,6 +62,15 @@ export class SearchEngine {
     /** Get a single catalog entry by composite ID */
     getTool(id) {
         return this.catalog.get(id);
+    }
+    /** Get a catalog entry with caching — use for describe to avoid repeated lookups */
+    getSchema(id) {
+        if (this.describeCache.has(id))
+            return this.describeCache.get(id);
+        const tool = this.catalog.get(id);
+        if (tool)
+            this.describeCache.set(id, tool);
+        return tool;
     }
     /**
      * Search the catalog using BM25 scoring.
@@ -57,6 +92,8 @@ export class SearchEngine {
                     id: t.id,
                     server: t.server,
                     name: t.name,
+                    displayName: toCamelCase(t.name),
+                    fieldNames: extractFieldNames(t.inputSchema),
                     description: t.description,
                     score: 0,
                 }));
@@ -72,13 +109,19 @@ export class SearchEngine {
                 return false;
             return true;
         })
-            .map((result) => ({
-            id: result.id,
-            server: result.server,
-            name: result.name,
-            description: result.description,
-            score: result.score || 0,
-        }))
+            .map((result) => {
+            const id = result.id;
+            const catalogEntry = this.catalog.get(id);
+            return {
+                id,
+                server: result.server,
+                name: result.name,
+                displayName: toCamelCase(result.name),
+                fieldNames: catalogEntry ? extractFieldNames(catalogEntry.inputSchema) : [],
+                description: result.description,
+                score: result.score || 0,
+            };
+        })
             .sort((a, b) => b.score - a.score)
             .slice(0, maxLimit);
     }
@@ -93,6 +136,7 @@ export class SearchEngine {
     ensureIndex() {
         if (!this.indexDirty && this.miniSearch)
             return;
+        this.indexDirty = false;
         const tools = Array.from(this.catalog.values());
         if (tools.length === 0) {
             this.miniSearch = null;
@@ -104,8 +148,6 @@ export class SearchEngine {
             fields: ["name", "title", "description", "server"],
             // Fields stored in the index (returned with results, avoids catalog lookup)
             storeFields: ["id", "server", "name", "title", "description"],
-            // NOTE: inputSchema is intentionally NOT stored here — that's the whole point
-            // of schema deferral. It only comes back via gateway.describe.
             searchOptions: {
                 boost: { name: 3, title: 2 }, // Tool name is strongest signal
                 fuzzy: 0.2, // Forgive typos

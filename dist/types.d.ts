@@ -30,6 +30,16 @@ export interface UpstreamConfig {
 export interface GatewayConfig {
     [serverKey: string]: UpstreamConfig;
 }
+/** A registered project for codegraph auto-injection */
+export interface CodeGraphProject {
+    name: string;
+    path: string;
+}
+/** Config section for codegraph defaults */
+export interface CodeGraphConfig {
+    projects?: CodeGraphProject[];
+    defaultProject?: string;
+}
 /**
  * Full catalog entry for one upstream tool.
  * Stored in SearchEngine, returned by gateway.describe.
@@ -61,8 +71,10 @@ export interface SearchResult {
     id: string;
     server: string;
     name: string;
+    displayName?: string;
     description?: string;
     score: number;
+    fieldNames?: string[];
 }
 /**
  * A stored full response from an upstream tool invocation.
