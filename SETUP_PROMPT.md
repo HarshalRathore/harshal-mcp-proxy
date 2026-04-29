@@ -4,7 +4,7 @@ Copy the entire content below and paste it into your AI coding agent (Claude Cod
 
 ---
 
-```
+````
 You are setting up harshal-mcp-proxy — a shared MCP gateway that sits between AI coding agents and upstream MCP servers.
 
 ## Goal
@@ -156,4 +156,4 @@ ps aux | grep "npm exec" | grep -v grep | wc -l
 - **pi can't find tools**: Run `/mcp reconnect` in pi, or check `~/.pi/agent/mcp.json` exists
 - **VS Code shows no tools**: Restart VS Code after updating `.vscode/mcp.json`
 - **Fallback to stdio**: If daemon fails, run `node dist/index.js` directly for single-client mode
-```
+````
