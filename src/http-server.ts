@@ -393,6 +393,7 @@ export class HttpMcpServer {
         name: r.name,
         displayName: r.displayName,
         server: r.server,
+        connected: this.connections.getConnectionState(r.server) === 'connected',
         description: r.description
           ? r.description.slice(0, 120) + (r.description.length > 120 ? "..." : "")
           : undefined,
@@ -454,12 +455,15 @@ export class HttpMcpServer {
     const serverKey = toolId.slice(0, separatorIndex);
     const toolName = toolId.slice(separatorIndex + 2);
 
-    const client = this.connections.getClient(serverKey);
-    if (!client) {
+    let client: import("@modelcontextprotocol/sdk/client/index.js").Client;
+    try {
+      client = await this.connections.ensureConnected(serverKey);
+      this.connections.markServerUsed(serverKey);
+    } catch (connectError) {
       return jsonRpcError(
         id,
         -32000,
-        `Server not connected: ${serverKey}. Connected servers: ${this.connections.getConnectedServers().join(", ")}`,
+        `Could not connect to server: ${serverKey}. ${(connectError as Error).message}`,
       );
     }
 

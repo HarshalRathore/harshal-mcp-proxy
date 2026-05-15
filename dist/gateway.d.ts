@@ -22,6 +22,8 @@ import { JobManager } from "./jobs.js";
 import { ConnectionManager } from "./connections.js";
 import { ResponseStore, ResponseShield } from "./response-store.js";
 import { ProjectRegistry } from "./projectRegistry.js";
+import { CatalogSnapshotManager } from "./catalog-snapshot.js";
+import { ResourceMonitor } from "./resource-monitor.js";
 export declare class MCPGateway {
     private config;
     private searchEngine;
@@ -30,18 +32,25 @@ export declare class MCPGateway {
     private responseStore;
     private responseShield;
     private projectRegistry;
+    private snapshotManager;
+    private resourceMonitor;
     private statusHolder;
     private lastReloadTimestamp;
     private pendingReload;
+    private lazyMode;
     private server;
-    constructor(configPath?: string);
+    constructor(configPath?: string, lazyMode?: boolean);
     /** Auto-inject projectPath for codegraph tools if not provided */
     private injectProjectPath;
     /**
      * Connect to all enabled upstream servers.
-     * Uses Promise.allSettled so one failing server doesn't block others.
+     * For lazy servers: load catalog snapshots without spawning processes.
+     * For eager servers (lazy.enabled=false or prewarm=true): connect normally.
+     *
+     * @param forceConnect - If true, connect to ALL servers regardless of lazy
+     *   setting (used by --discover to build initial snapshots).
      */
-    connectAll(): Promise<void>;
+    connectAll(forceConnect?: boolean): Promise<void>;
     /**
      * Start the gateway with stdio transport.
      * This is the main entry point when used from opencode.
@@ -72,6 +81,8 @@ export declare class MCPGateway {
         responseShield: ResponseShield;
         projectRegistry: ProjectRegistry;
         statusHolder: import("./handlers.js").StatusHolder;
+        snapshotManager: CatalogSnapshotManager;
+        resourceMonitor: ResourceMonitor;
     };
     /** Graceful shutdown — stop watching, drain jobs, disconnect all */
     shutdown(): Promise<void>;

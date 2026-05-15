@@ -25,6 +25,9 @@ import { ConnectionManager } from "./connections.js";
 import { ResponseStore, ResponseShield } from "./response-store.js";
 import { createServer } from "./handlers.js";
 import { ProjectRegistry } from "./projectRegistry.js";
+import { normalizeLazyConfig } from "./lazy-config.js";
+import { CatalogSnapshotManager } from "./catalog-snapshot.js";
+import { ResourceMonitor } from "./resource-monitor.js";
 export class MCPGateway {
     config;
     searchEngine;
@@ -33,16 +36,26 @@ export class MCPGateway {
     responseStore;
     responseShield;
     projectRegistry;
+    snapshotManager;
+    resourceMonitor;
     statusHolder;
     lastReloadTimestamp = Date.now();
     pendingReload = false;
+    lazyMode;
     server;
-    constructor(configPath) {
+    constructor(configPath, lazyMode) {
+        this.lazyMode = lazyMode || false;
         // Initialize all subsystems
         this.config = new Config(configPath);
         this.searchEngine = new SearchEngine();
         this.jobManager = new JobManager();
         this.connections = new ConnectionManager(this.searchEngine);
+        this.snapshotManager = new CatalogSnapshotManager();
+        this.resourceMonitor = new ResourceMonitor();
+        // Wire lazy-loading dependencies into ConnectionManager
+        this.connections.setConfigProvider(() => this.config.getAll());
+        this.connections.setSnapshotManager(this.snapshotManager);
+        this.connections.setResourceMonitor(this.resourceMonitor);
         this.responseStore = new ResponseStore();
         this.responseShield = new ResponseShield(this.responseStore);
         // Initialize project registry with scan roots from config or env
@@ -72,7 +85,6 @@ export class MCPGateway {
         this.statusHolder = statusHolder;
         this.server = createServer(this.searchEngine, this.connections, this.jobManager, this.responseStore, this.responseShield, this.projectRegistry, statusHolder);
         // Wire up the job manager's execute function
-        // This is called when an async job is dequeued
         this.jobManager.setExecuteJob(async (job) => {
             const separatorIndex = job.toolId.toString().indexOf("::");
             if (separatorIndex === -1) {
@@ -80,22 +92,9 @@ export class MCPGateway {
             }
             const serverKey = job.toolId.toString().slice(0, separatorIndex);
             const toolName = job.toolId.toString().slice(separatorIndex + 2);
-            let client = this.connections.getClient(serverKey);
-            if (!client) {
-                // Attempt reconnection for this server
-                const serverConfig = this.config.get(serverKey);
-                if (serverConfig) {
-                    try {
-                        await this.connections.connectWithRetry(serverKey, serverConfig, 3, 1000);
-                        client = this.connections.getClient(serverKey);
-                    }
-                    catch {
-                        // Reconnect failed
-                    }
-                }
-            }
-            if (!client)
-                throw new Error(`Server not connected: ${serverKey}`);
+            // On-demand connect for lazy servers
+            const client = await this.connections.ensureConnected(serverKey);
+            this.connections.markServerUsed(serverKey);
             // Auto-inject projectPath for codegraph tools
             let finalArgs = job.args;
             if (serverKey === "codegraph" && finalArgs) {
@@ -122,21 +121,58 @@ export class MCPGateway {
     }
     /**
      * Connect to all enabled upstream servers.
-     * Uses Promise.allSettled so one failing server doesn't block others.
+     * For lazy servers: load catalog snapshots without spawning processes.
+     * For eager servers (lazy.enabled=false or prewarm=true): connect normally.
+     *
+     * @param forceConnect - If true, connect to ALL servers regardless of lazy
+     *   setting (used by --discover to build initial snapshots).
      */
-    async connectAll() {
+    async connectAll(forceConnect = false) {
         const allConfig = this.config.getAll();
-        const connectionPromises = Object.entries(allConfig)
-            .filter(([_, config]) => config.enabled !== false)
-            .map(([serverKey, config]) => this.connections.connectWithRetry(serverKey, config).catch((err) => {
+        const eagerKeys = [];
+        const lazyKeys = [];
+        for (const [serverKey, config] of Object.entries(allConfig)) {
+            if (config.enabled === false)
+                continue;
+            const lazy = normalizeLazyConfig(config.lazy);
+            if (!forceConnect && lazy.enabled && !lazy.prewarm) {
+                lazyKeys.push(serverKey);
+            }
+            else {
+                eagerKeys.push(serverKey);
+            }
+        }
+        // Eager-connect non-lazy servers (existing behavior)
+        const eagerPromises = eagerKeys.map((serverKey) => this.connections.connectWithRetry(serverKey, allConfig[serverKey]).catch((err) => {
             console.error(`  [${serverKey}] FAILED: ${err.message}`);
         }));
-        await Promise.allSettled(connectionPromises);
-        // Rebuild search index after all connections
+        await Promise.allSettled(eagerPromises);
+        // For lazy servers: load snapshots without connecting
+        let snapshotLoadedCount = 0;
+        for (const serverKey of lazyKeys) {
+            const snapshot = this.snapshotManager.loadSnapshot(serverKey);
+            if (snapshot) {
+                for (const tool of snapshot) {
+                    this.searchEngine.addTool(tool);
+                }
+                snapshotLoadedCount += snapshot.length;
+                console.error(`  [${serverKey}] Lazy — loaded ${snapshot.length} tools from snapshot`);
+            }
+            else {
+                console.error(`  [${serverKey}] Lazy — no snapshot, will discover on first use`);
+            }
+        }
+        // Rebuild search index
         this.searchEngine.warmup();
         const toolCount = this.searchEngine.getTools().length;
-        const serverCount = this.connections.getConnectedServers().length;
-        console.error(`  [gateway] Ready: ${toolCount} tools from ${serverCount} servers`);
+        const connectedCount = this.connections.getConnectedServers().length;
+        const lazyCount = lazyKeys.length;
+        console.error(`  [gateway] Ready: ${toolCount} tools (${connectedCount} connected + ${lazyCount} lazy) from ${Object.keys(allConfig).length} servers`);
+        // Start idle monitor if any lazy servers exist
+        // (both stdio and daemon modes need this)
+        if (lazyCount > 0) {
+            this.connections.startIdleMonitor(30000);
+        }
     }
     /**
      * Start the gateway with stdio transport.
@@ -156,10 +192,17 @@ export class MCPGateway {
         // Signal to opencode that we're ready to receive requests
         // This MUST go to stdout (not stderr) — opencode parses it
         console.log("__MCP_GATEWAY_STDIO_READY__");
-        // Connect to upstream servers in the background
-        this.connectAll().catch((err) => {
-            console.error(`  [gateway] Background connection error: ${err.message}`);
-        });
+        // Connect to upstream servers in the background (unless --lazy)
+        if (!this.lazyMode) {
+            this.connectAll().catch((err) => {
+                console.error(`  [gateway] Background connection error: ${err.message}`);
+            });
+        }
+        else {
+            console.error("  [gateway] Lazy mode — skipping background connect, servers will connect on demand");
+        }
+        // Start idle monitor for lazy servers
+        this.connections.startIdleMonitor(30000);
         // Watch config file for hot-reload
         this.config.watch((oldCfg, newCfg) => this.handleConfigChange(oldCfg, newCfg));
     }
@@ -179,8 +222,8 @@ export class MCPGateway {
         setTimeout(async () => {
             // Remove deleted servers
             for (const key of toRemove) {
-                await this.connections.disconnect(key);
-                console.error(`    ${key} — disconnected (removed from config)`);
+                await this.connections.removeServer(key);
+                console.error(`    ${key} — removed from config`);
             }
             // Check for changes in existing servers
             for (const key of toCheck) {
@@ -191,30 +234,60 @@ export class MCPGateway {
                     continue;
                 // Was enabled → now disabled: disconnect
                 if (oldC?.enabled !== false && newC?.enabled === false) {
-                    await this.connections.disconnect(key);
+                    await this.connections.removeServer(key);
                     console.error(`    ${key} — disabled`);
                     continue;
                 }
                 // Was disabled → now enabled: connect
                 if (oldC?.enabled === false && newC?.enabled !== false) {
-                    try {
-                        await this.connections.connectWithRetry(key, newC);
-                        console.error(`    ${key} — enabled`);
+                    const lazy = normalizeLazyConfig(newC.lazy);
+                    if (lazy.enabled && !lazy.prewarm) {
+                        // Lazy server: load snapshot if available
+                        const snapshot = this.snapshotManager.loadSnapshot(key);
+                        if (snapshot) {
+                            for (const tool of snapshot) {
+                                this.searchEngine.addTool(tool);
+                            }
+                            console.error(`    ${key} — enabled (lazy, loaded ${snapshot.length} tools from snapshot)`);
+                        }
+                        else {
+                            console.error(`    ${key} — enabled (lazy, no snapshot yet)`);
+                        }
                     }
-                    catch (e) {
-                        console.error(`    ${key} — failed: ${e.message}`);
+                    else {
+                        try {
+                            await this.connections.connectWithRetry(key, newC);
+                            console.error(`    ${key} — enabled`);
+                        }
+                        catch (e) {
+                            console.error(`    ${key} — failed: ${e.message}`);
+                        }
                     }
                     continue;
                 }
                 // Both enabled — check for config changes
                 if (JSON.stringify(oldC) !== JSON.stringify(newC)) {
                     await this.connections.disconnect(key);
-                    try {
-                        await this.connections.connectWithRetry(key, newC);
-                        console.error(`    ${key} — reconnected (config changed)`);
+                    const lazy = normalizeLazyConfig(newC.lazy);
+                    if (lazy.enabled && !lazy.prewarm) {
+                        // Reconnect to refresh snapshot, then immediately disconnect
+                        try {
+                            await this.connections.connectWithRetry(key, newC);
+                            await this.connections.disconnect(key);
+                            console.error(`    ${key} — snapshot refreshed (lazy)`);
+                        }
+                        catch (e) {
+                            console.error(`    ${key} — refresh failed: ${e.message}`);
+                        }
                     }
-                    catch (e) {
-                        console.error(`    ${key} — reconnect failed: ${e.message}`);
+                    else {
+                        try {
+                            await this.connections.connectWithRetry(key, newC);
+                            console.error(`    ${key} — reconnected (config changed)`);
+                        }
+                        catch (e) {
+                            console.error(`    ${key} — reconnect failed: ${e.message}`);
+                        }
                     }
                 }
             }
@@ -222,12 +295,29 @@ export class MCPGateway {
             for (const key of toAdd) {
                 const config = newConfig[key];
                 if (config?.enabled !== false) {
-                    try {
-                        await this.connections.connectWithRetry(key, config);
-                        console.error(`    ${key} — connected (new)`);
+                    const lazy = normalizeLazyConfig(config.lazy);
+                    if (lazy.enabled && !lazy.prewarm) {
+                        // Lazy server: just load snapshot if available
+                        const snapshot = this.snapshotManager.loadSnapshot(key);
+                        if (snapshot) {
+                            for (const tool of snapshot) {
+                                this.searchEngine.addTool(tool);
+                            }
+                            console.error(`    ${key} — lazy loaded from snapshot (${snapshot.length} tools)`);
+                        }
+                        else {
+                            console.error(`    ${key} — lazy, no snapshot yet`);
+                        }
                     }
-                    catch (e) {
-                        console.error(`    ${key} — failed: ${e.message}`);
+                    else {
+                        // Eager connect
+                        try {
+                            await this.connections.connectWithRetry(key, config);
+                            console.error(`    ${key} — connected (new)`);
+                        }
+                        catch (e) {
+                            console.error(`    ${key} — failed: ${e.message}`);
+                        }
                     }
                 }
             }
@@ -251,12 +341,16 @@ export class MCPGateway {
             responseShield: this.responseShield,
             projectRegistry: this.projectRegistry,
             statusHolder: this.statusHolder,
+            snapshotManager: this.snapshotManager,
+            resourceMonitor: this.resourceMonitor,
         };
     }
     /** Graceful shutdown — stop watching, drain jobs, disconnect all */
     async shutdown() {
         console.error("  [gateway] Shutting down...");
         this.config.stopWatching();
+        this.connections.stopIdleMonitor();
+        this.resourceMonitor.stopMonitoring();
         await this.jobManager.shutdown();
         await this.connections.disconnectAll();
         await this.server.close();

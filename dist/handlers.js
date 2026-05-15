@@ -65,6 +65,7 @@ export function createServer(searchEngine, connections, jobManager, responseStor
                             name: r.name,
                             displayName: r.displayName,
                             server: r.server,
+                            connected: connections.getConnectionState(r.server) === 'connected',
                             description: r.description
                                 ? r.description.slice(0, 120) + (r.description.length > 120 ? "..." : "")
                                 : undefined,
@@ -142,13 +143,20 @@ export function createServer(searchEngine, connections, jobManager, responseStor
         }
         const serverKey = id.slice(0, separatorIndex);
         const toolName = id.slice(separatorIndex + 2);
-        const client = connections.getClient(serverKey);
+        // Try to get client or connect on-demand
+        let client = connections.getClient(serverKey);
         if (!client) {
-            return {
-                content: [{ type: "text", text: `ERROR: Server not connected: ${serverKey}. Connected servers: ${connections.getConnectedServers().join(", ")}` }],
-                isError: true,
-            };
+            try {
+                client = await connections.ensureConnected(serverKey);
+            }
+            catch (connectError) {
+                return {
+                    content: [{ type: "text", text: `ERROR: Could not connect to server: ${serverKey}. ${connectError.message}` }],
+                    isError: true,
+                };
+            }
         }
+        connections.markServerUsed(serverKey);
         const tool = searchEngine.getTool(id);
         if (!tool) {
             return {

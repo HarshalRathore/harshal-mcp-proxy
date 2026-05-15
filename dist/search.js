@@ -55,6 +55,22 @@ export class SearchEngine {
         this.catalog.delete(id);
         this.indexDirty = true;
     }
+    /** Remove all tools belonging to a specific server (used when server removed from config) */
+    removeServerTools(serverKey) {
+        const toRemove = [];
+        for (const [id, tool] of this.catalog) {
+            if (tool.server === serverKey) {
+                toRemove.push(id);
+            }
+        }
+        for (const id of toRemove) {
+            this.catalog.delete(id);
+            this.describeCache.delete(id);
+        }
+        if (toRemove.length > 0) {
+            this.indexDirty = true;
+        }
+    }
     /** Get all catalog entries (used for counting, filtering by server, etc.) */
     getTools() {
         return Array.from(this.catalog.values());

@@ -10,9 +10,14 @@
  * Environment variable substitution:
  *   {env:VAR_NAME} in config.environment fields gets replaced with process.env values.
  *   This lets you keep secrets in shell env instead of the config file.
+ *
+ * Lazy loading: servers can be connected on demand via ensureConnected(),
+ * with idle timeout auto-disconnect and resource monitoring.
  */
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import type { UpstreamConfig } from "./types.js";
+import type { ConnectionState, ServerStats, UpstreamConfig } from "./types.js";
+import type { CatalogSnapshotManager } from "./catalog-snapshot.js";
+import type { ResourceMonitor } from "./resource-monitor.js";
 import { SearchEngine } from "./search.js";
 /**
  * Replace {env:VAR_NAME} patterns with actual environment variable values.
@@ -23,7 +28,20 @@ export declare class ConnectionManager {
     private searchEngine;
     /** Active upstream client connections keyed by server name */
     private upstreams;
+    /** Connection state tracking per server */
+    private states;
+    /** Deduplication for concurrent on-demand connects */
+    private connectingPromises;
+    /** Lazy dependencies — set by gateway after construction */
+    private configProvider?;
+    private snapshotManager?;
+    private resourceMonitor?;
+    /** Idle monitor timer */
+    private idleMonitorId?;
     constructor(searchEngine: SearchEngine);
+    setConfigProvider(provider: () => Record<string, UpstreamConfig>): void;
+    setSnapshotManager(manager: CatalogSnapshotManager): void;
+    setResourceMonitor(monitor: ResourceMonitor): void;
     /** Connect to a single upstream server (dispatches to local or remote) */
     connect(serverKey: string, config: UpstreamConfig): Promise<void>;
     /**
@@ -52,7 +70,7 @@ export declare class ConnectionManager {
     private connectTransport;
     /**
      * Fetch listTools() from upstream and register each tool in the search engine.
-     * This is where we capture the full inputSchema for later use by gateway.describe.
+     * Also saves a snapshot for lazy-loading catalog persistence.
      */
     private refreshCatalog;
     /** Count how many tools a specific server has registered */
@@ -64,8 +82,26 @@ export declare class ConnectionManager {
     connectWithRetry(serverKey: string, config: UpstreamConfig, maxRetries?: number, baseDelay?: number): Promise<void>;
     /** Get a connected Client by server key (for invoking tools). */
     getClient(serverKey: string): Client | undefined;
-    /** Disconnect a single server and remove its tools from the catalog */
+    /** Disconnect a single server. Does NOT remove tools from the catalog. */
     disconnect(serverKey: string): Promise<void>;
+    /** Fully remove a server: disconnect + remove tools from catalog + delete snapshot */
+    removeServer(serverKey: string): Promise<void>;
+    /**
+     * Ensure a server is connected, connecting on demand if necessary.
+     * Deduplicates concurrent connection attempts for the same server.
+     */
+    ensureConnected(serverKey: string): Promise<Client>;
+    /** Mark a server as recently used (called after successful invoke) */
+    markServerUsed(serverKey: string): void;
+    /**
+     * Start periodic idle check. For each connected lazy server,
+     * disconnect if idle timeout exceeded or RAM limit exceeded.
+     */
+    startIdleMonitor(checkIntervalMs: number): void;
+    /** Stop the idle monitor */
+    stopIdleMonitor(): void;
+    getConnectionState(serverKey: string): ConnectionState;
+    getServerStats(serverKey: string): ServerStats | null;
     /** Disconnect all upstream servers */
     disconnectAll(): Promise<void>;
     /** List all currently connected server keys */

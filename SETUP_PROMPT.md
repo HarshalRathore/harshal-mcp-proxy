@@ -163,4 +163,18 @@ ps aux | grep "npm exec" | grep -v grep | wc -l
 - **pi can't find tools**: Run `/mcp reconnect` in pi, or check `~/.pi/agent/mcp.json` exists
 - **VS Code shows no tools**: Restart VS Code after updating `.vscode/mcp.json`
 - **Fallback to stdio**: If daemon fails, run `harshal-mcp-proxy` directly for single-client mode
+
+## Post-Setup: Teach Your Agent (Final Step)
+
+After installation, verify the agent can actually use the proxy:
+
+1. Check that `AGENT-CONTEXT.md` is loaded by your agent
+2. Ask your agent to run: `gateway.search({ query: "health" })`
+3. If it works, great! Your agent learned the call pattern.
+4. If it doesn't, the agent should use the **Self-Healing Note** in AGENT-CONTEXT.md
+   to try alternative call formats, discover the correct one, and **update its own
+   rules file** so it doesn't forget.
+
+Once verified, you're done. The proxy is running, your agent knows how to use it,
+and all your AI tools share one efficient set of MCP servers.
 ````

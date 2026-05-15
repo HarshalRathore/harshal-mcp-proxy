@@ -10,11 +10,17 @@
  * Environment variable substitution:
  *   {env:VAR_NAME} in config.environment fields gets replaced with process.env values.
  *   This lets you keep secrets in shell env instead of the config file.
+ *
+ * Lazy loading: servers can be connected on demand via ensureConnected(),
+ * with idle timeout auto-disconnect and resource monitoring.
  */
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import type { UpstreamConfig, ToolCatalogEntry } from "./types.js";
+import type { ConnectionState, ServerConnectionRecord, ServerStats, UpstreamConfig, ToolCatalogEntry } from "./types.js";
+import type { CatalogSnapshotManager } from "./catalog-snapshot.js";
+import { createServerRecord } from "./connection-state.js";
+import type { ResourceMonitor } from "./resource-monitor.js";
 import { SearchEngine } from "./search.js";
 
 /**
@@ -42,7 +48,33 @@ export class ConnectionManager {
   /** Active upstream client connections keyed by server name */
   private upstreams = new Map<string, Client>();
 
+  /** Connection state tracking per server */
+  private states = new Map<string, ServerConnectionRecord>();
+
+  /** Deduplication for concurrent on-demand connects */
+  private connectingPromises = new Map<string, Promise<Client>>();
+
+  /** Lazy dependencies — set by gateway after construction */
+  private configProvider?: () => Record<string, UpstreamConfig>;
+  private snapshotManager?: CatalogSnapshotManager;
+  private resourceMonitor?: ResourceMonitor;
+
+  /** Idle monitor timer */
+  private idleMonitorId?: ReturnType<typeof setInterval>;
+
   constructor(private searchEngine: SearchEngine) {}
+
+  setConfigProvider(provider: () => Record<string, UpstreamConfig>): void {
+    this.configProvider = provider;
+  }
+
+  setSnapshotManager(manager: CatalogSnapshotManager): void {
+    this.snapshotManager = manager;
+  }
+
+  setResourceMonitor(monitor: ResourceMonitor): void {
+    this.resourceMonitor = monitor;
+  }
 
   /** Connect to a single upstream server (dispatches to local or remote) */
   async connect(serverKey: string, config: UpstreamConfig): Promise<void> {
@@ -139,6 +171,22 @@ export class ConnectionManager {
     await client.connect(transport);
     this.upstreams.set(serverKey, client);
 
+    // Set state to connected
+    const state = this.states.get(serverKey) || createServerRecord();
+    state.state = 'connected';
+    state.connectedAt = Date.now();
+    state.requestCount = 0;
+    this.states.set(serverKey, state);
+
+    // Try to discover PID for stdio processes
+    if (this.resourceMonitor) {
+      const pid = this.resourceMonitor.findPidByCommand('node', process.pid);
+      if (pid) {
+        state.pid = pid;
+        this.resourceMonitor.setPid(serverKey, pid);
+      }
+    }
+
     // Fetch and register all tools from this upstream
     await this.refreshCatalog(serverKey, client);
     console.error(`  [${serverKey}] Connected — ${this.countTools(serverKey)} tools`);
@@ -146,10 +194,11 @@ export class ConnectionManager {
 
   /**
    * Fetch listTools() from upstream and register each tool in the search engine.
-   * This is where we capture the full inputSchema for later use by gateway.describe.
+   * Also saves a snapshot for lazy-loading catalog persistence.
    */
   private async refreshCatalog(serverKey: string, client: Client): Promise<void> {
     const response = await client.listTools();
+    const tools: ToolCatalogEntry[] = [];
 
     for (const tool of response.tools) {
       const entry: ToolCatalogEntry = {
@@ -159,7 +208,13 @@ export class ConnectionManager {
         description: tool.description,
         inputSchema: tool.inputSchema,
       };
+      tools.push(entry);
       this.searchEngine.addTool(entry);
+    }
+
+    // Save snapshot for lazy loading
+    if (this.snapshotManager) {
+      this.snapshotManager.saveSnapshot(serverKey, tools);
     }
   }
 
@@ -204,23 +259,151 @@ export class ConnectionManager {
     return this.upstreams.get(serverKey);
   }
 
-  /** Disconnect a single server and remove its tools from the catalog */
+  /** Disconnect a single server. Does NOT remove tools from the catalog. */
   async disconnect(serverKey: string): Promise<void> {
     const client = this.upstreams.get(serverKey);
     if (client) {
-      // Remove all tools for this server from the search index
-      const tools = this.searchEngine.getTools().filter((t) => t.server === serverKey);
-      for (const tool of tools) {
-        this.searchEngine.removeTool(tool.id);
-      }
-
       try {
         await client.close();
       } catch {
-        // Ignore close errors — server might already be dead
+        // Ignore close errors
       }
       this.upstreams.delete(serverKey);
     }
+
+    // Update state
+    const state = this.states.get(serverKey);
+    if (state) {
+      state.state = 'disconnected';
+      if (state.pid && this.resourceMonitor) {
+        this.resourceMonitor.clearPid(serverKey);
+        state.pid = undefined;
+      }
+    }
+
+    console.error(`  [${serverKey}] Disconnected`);
+  }
+
+  /** Fully remove a server: disconnect + remove tools from catalog + delete snapshot */
+  async removeServer(serverKey: string): Promise<void> {
+    await this.disconnect(serverKey);
+    (this.searchEngine as any).removeServerTools?.(serverKey);
+    this.states.delete(serverKey);
+    if (this.snapshotManager) {
+      this.snapshotManager.removeSnapshot(serverKey);
+    }
+    if (this.resourceMonitor) {
+      this.resourceMonitor.unregister(serverKey);
+    }
+  }
+
+  /**
+   * Ensure a server is connected, connecting on demand if necessary.
+   * Deduplicates concurrent connection attempts for the same server.
+   */
+  async ensureConnected(serverKey: string): Promise<Client> {
+    const existing = this.upstreams.get(serverKey);
+    if (existing) return existing;
+
+    const pending = this.connectingPromises.get(serverKey);
+    if (pending) {
+      return pending;
+    }
+
+    if (!this.configProvider) {
+      throw new Error(`[${serverKey}] No config provider set`);
+    }
+
+    const config = this.configProvider()[serverKey];
+    if (!config) {
+      throw new Error(`[${serverKey}] Not found in config`);
+    }
+
+    const promise = this.connectWithRetry(serverKey, config, 3, 1000)
+      .then(() => {
+        const client = this.upstreams.get(serverKey);
+        if (!client) throw new Error(`[${serverKey}] Connect succeeded but client missing`);
+        return client;
+      })
+      .catch((err) => {
+        const state = this.states.get(serverKey) || createServerRecord();
+        state.state = 'failed';
+        this.states.set(serverKey, state);
+        throw err;
+      })
+      .finally(() => {
+        this.connectingPromises.delete(serverKey);
+      });
+
+    this.connectingPromises.set(serverKey, promise);
+    return promise;
+  }
+
+  /** Mark a server as recently used (called after successful invoke) */
+  markServerUsed(serverKey: string): void {
+    const state = this.states.get(serverKey);
+    if (state) {
+      state.lastUsedAt = Date.now();
+      state.requestCount++;
+    }
+  }
+
+  /**
+   * Start periodic idle check. For each connected lazy server,
+   * disconnect if idle timeout exceeded or RAM limit exceeded.
+   */
+  startIdleMonitor(checkIntervalMs: number): void {
+    if (this.idleMonitorId) return;
+
+    this.idleMonitorId = setInterval(() => {
+      const now = Date.now();
+      for (const [serverKey, state] of this.states) {
+        if (state.state !== 'connected') continue;
+        if (!this.configProvider) continue;
+
+        const config = this.configProvider()[serverKey];
+        if (!config?.lazy?.enabled) continue;
+
+        const idleTimeout = config.lazy.idleTimeoutMs || 300000;
+
+        // Don't disconnect if used in the last 5 seconds (safety buffer)
+        if (now - state.lastUsedAt < 5000) continue;
+
+        if (state.lastUsedAt > 0 && now - state.lastUsedAt > idleTimeout) {
+          console.error(`  [lazy] ${serverKey} idle for ${Math.round((now - state.lastUsedAt) / 1000)}s — disconnecting`);
+          this.disconnect(serverKey).catch((err) => {
+            console.error(`  [lazy] Failed to disconnect ${serverKey}: ${err.message}`);
+          });
+        }
+      }
+    }, checkIntervalMs);
+  }
+
+  /** Stop the idle monitor */
+  stopIdleMonitor(): void {
+    if (this.idleMonitorId) {
+      clearInterval(this.idleMonitorId);
+      this.idleMonitorId = undefined;
+    }
+  }
+
+  getConnectionState(serverKey: string): ConnectionState {
+    return this.states.get(serverKey)?.state || 'disconnected';
+  }
+
+  getServerStats(serverKey: string): ServerStats | null {
+    const state = this.states.get(serverKey);
+    if (!state) return null;
+
+    return {
+      name: serverKey,
+      state: state.state,
+      toolCount: this.countTools(serverKey),
+      lastUsedAt: state.lastUsedAt || null,
+      requestCount: state.requestCount,
+      ramMb: null, // populated by resource monitor if available
+      uptimeMs: state.connectedAt > 0 ? Date.now() - state.connectedAt : null,
+    };
   }
 
   /** Disconnect all upstream servers */

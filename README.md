@@ -26,6 +26,12 @@ startup, it loads **6 tool definitions from this proxy** (~375 tokens). The prox
 3. **Shared process elimination** — In daemon mode, ONE proxy instance serves ALL your AI
    clients (pi, VS Code, etc.), eliminating duplicate MCP server processes.
 
+4. **On-demand lazy loading** — MCP server processes are no longer started at boot.
+   Instead, tool schemas are loaded from disk-based **catalog snapshots** at startup.
+   The actual server process is spawned only when you first invoke a tool on that server.
+   After 5 minutes of inactivity, the idle monitor auto-disconnects it — freeing RAM
+   and CPU without losing searchability.
+
 ---
 
 ## Why the Shared Daemon?
@@ -87,6 +93,18 @@ node dist/index.js --daemon
 node dist/index.js --port 8765
 ```
 
+### Mode 3: Catalog Discovery (snapshot builder)
+
+Build tool schema snapshots for all servers without keeping them running. Run this
+once after adding a new server or updating tool schemas.
+
+```bash
+node dist/index.js --discover
+# Connects to ALL servers, fetches tool schemas, saves snapshots to disk, then exits
+```
+
+Catalog snapshots are stored in `~/.cache/harshal-mcp-proxy/catalogs/`.
+
 ---
 
 ## The 6 Gateway Tools
@@ -129,7 +147,32 @@ cat SETUP_PROMPT.md | xclip   # Linux (or just cat the file and copy it)
 ```
 
 The prompt covers: installation, config, systemd service, pi integration, VS Code
-integration, verification, and troubleshooting — all in one shot.
+integration, agent context installation, verification, and troubleshooting — all in
+one shot.
+
+### For existing installations: Teach Your Agent
+
+If you already have harshal-mcp-proxy running but your agent doesn't know how to
+call the gateway tools, use the [AGENT-CONTEXT.md](./AGENT-CONTEXT.md) file:
+
+```bash
+# Copy into your agent's config:
+
+# For Pi:
+cp AGENT-CONTEXT.md .pi/rules/mcp-proxy-context.md
+
+# For Claude Code / Opencode:
+cp AGENT-CONTEXT.md .opencode/rules/mcp-proxy-context.md
+
+# For Cline (VS Code):
+cp AGENT-CONTEXT.md .clinerules
+
+# For Cursor:
+cp AGENT-CONTEXT.md .cursorrules
+```
+
+Then reference it in your agent's startup config (e.g., `.pi/APPEND_SYSTEM.md`,
+`AGENTS.md`, `CLAUDE.md`, `.cursorrules`, etc.) so every session loads it.
 
 ---
 
@@ -423,14 +466,55 @@ No restart needed.
 
 ## Config File
 
-`~/.config/harshal-mcp-proxy/config.json` defines all upstream MCP servers:
+`~/.config/harshal-mcp-proxy/config.json` defines all upstream MCP servers.
+
+The `lazy` field controls on-demand loading per server. When enabled, the server
+process is NOT started at boot — tool schemas are loaded from a cached snapshot.
+The process spawns on first use and auto-disconnects after idle timeout.
+
+### Minimal config (one lazy server)
+
+```json
+{
+  "playwright": {
+    "type": "local",
+    "command": ["npx", "@playwright/mcp@latest", "--extension"],
+    "lazy": { "enabled": true }
+  }
+}
+```
+
+### All 12 servers lazy (paste this pattern on every server)
+
+```json
+{
+  "repeato-backend-mcp-server": {
+    "type": "local",
+    "command": ["node", "server/index.js"],
+    "lazy": { "enabled": true }
+  },
+  "neo4j-cypher": {
+    "type": "local",
+    "command": ["npx", "-y", "mcp-neo4j-server"],
+    "lazy": { "enabled": true }
+  },
+  ...
+}
+```
 
 ```json
 {
   "server-name": {
     "type": "local",
     "command": ["npx", "-y", "some-mcp-package"],
-    "enabled": true
+    "enabled": true,
+    "lazy": {
+      "enabled": true,
+      "idleTimeoutMs": 300000,
+      "connectTimeoutMs": 10000,
+      "maxRamMb": 512,
+      "prewarm": false
+    }
   },
   "remote-server": {
     "type": "remote",
@@ -439,6 +523,34 @@ No restart needed.
   }
 }
 ```
+
+### Lazy Config Options
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `enabled` | `false` | Enable lazy loading for this server |
+| `idleTimeoutMs` | `300000` (5 min) | Disconnect after inactivity |
+| `connectTimeoutMs` | `10000` (10 sec) | Abort connect if it takes longer |
+| `maxRamMb` | `512` | Force-disconnect if RSS exceeds this |
+| `prewarm` | `false` | Connect at startup (ignores lazy if true, but still idle-timeouts) |
+
+### How to make all servers lazy
+
+Simply add `"lazy": { "enabled": true }` to every server in your config.
+The daemon starts instantly with 0 server processes, loading only from
+catalog snapshots on disk.
+
+### Building catalog snapshots
+
+After enabling lazy on servers with no cached snapshot, run `--discover` once:
+
+```bash
+node dist/index.js --discover
+```
+
+This connects to ALL servers, fetches tool schemas, saves them to
+`~/.cache/harshal-mcp-proxy/catalogs/<server>.json`, then exits.
+After that, the daemon can load schemas from disk without spawning processes.
 
 Environment variable substitution (`{env:VAR_NAME}`) is supported in environment fields.
 
@@ -452,13 +564,131 @@ Environment variable substitution (`{env:VAR_NAME}`) is supported in environment
 | Tool response overhead | Unbounded | Max 64KB per response | **Bounded** |
 | **Total per-session baseline** | **~50,000 tokens** | **~375 tokens** | **~99.3%** |
 
-## Memory Savings (Daemon Mode)
+## Memory Savings (Daemon + Lazy Mode)
+
+With lazy loading enabled, the daemon starts with **zero MCP server processes** — only
+catalog snapshots are loaded from disk. Servers spawn on-demand and auto-disconnect
+after 5 minutes of inactivity.
 
 | Scenario | MCP Processes | RAM Used | Available |
 |----------|--------------|----------|-----------|
 | 2 pi sessions + VS Code (before) | ~35 processes | ~4 GB MCP overhead | ~1.5 GB |
-| Shared daemon (after) | ~10 processes | ~1.3 GB MCP overhead | ~4.8 GB |
-| **Saved** | **25 processes** | **~2.7 GB** | **+3.3 GB** |
+| Shared daemon (eager) | ~10 processes | ~1.3 GB MCP overhead | ~4.8 GB |
+| Shared daemon (lazy, idle) | **0 processes** | **~50 MB** | **~6.2 GB** |
+| Shared daemon (lazy, active) | ~10 processes | ~1.3 GB MCP overhead | ~4.8 GB |
+
+**At idle with lazy loading: 0 server processes, ~50 MB total RAM.**
+
+---
+
+## On-Demand Lazy Loading
+
+Lazy loading is the gateway's built-in mechanism for MCP server process lifecycle
+management. Instead of spawning all servers at boot, it uses **catalog snapshots** to
+make tool schemas searchable immediately, while deferring process creation until
+a tool is actually invoked.
+
+### How It Works
+
+```
+STARTUP (all servers lazy):
+
+  gateway.connectAll()
+    ├─ Load searchable tool schemas from disk snapshots
+    └─ Start idle monitor (checks every 30s)
+
+  Result: 138 tools searchable, 0 server processes, ~50 MB RAM
+
+FIRST INVOKE (e.g. gateway.invoke "playwright::browser_navigate"):
+
+  gateway.invoke handler
+    ├─ connections.ensureConnected("playwright")   ← spawns process
+    ├─ connections.markServerUsed("playwright")    ← records timestamp
+    └─ client.callTool("browser_navigate")         ← executes
+
+  Result: Playwright process running, tool executed, snapshot saved
+
+IDLE (5+ minutes of no use):
+
+  idle monitor (every 30s):
+    └─ "playwright" idle for 319s > 300s timeout → disconnect
+
+  Result: Playwright process killed, still searchable via snapshot
+
+NEXT INVOKE:
+  └─ ensureConnected() → respawns from scratch (snapshot already cached)
+```
+
+### What happens to `gateway.search`?
+
+Search results show a `connected` field so you can tell at a glance which servers
+are active vs. available-on-demand:
+
+```json
+{
+  "results": [
+    {
+      "id": "neo4j-cypher::execute_query",
+      "server": "neo4j-cypher",
+      "connected": false,     // ← not running, will spawn on invoke
+      "score": 51.68
+    },
+    {
+      "id": "repeato-backend-mcp-server::health_check",
+      "server": "repeato-backend-mcp-server",
+      "connected": true,      // ← currently active
+      "score": 42.0
+    }
+  ]
+}
+```
+
+### Per-Server vs Global Lazy
+
+- **Per-server `lazy.enabled`** — set in `config.json`. Each server independently
+  controls whether it loads on-demand or eagerly. You can mix eager (frequently used)
+  and lazy (rarely used) servers in the same config.
+- **`--discover` mode** — force-connects ALL servers (ignoring lazy) to build or
+  refresh catalog snapshots. Run once after adding a new server, then shut down.
+
+### Auto-Disconnect: Idle Monitor
+
+The idle monitor checks every 30 seconds and disconnects servers that have been
+inactive longer than `idleTimeoutMs` (default 5 minutes).
+
+- Uses `lastUsedAt` timestamp updated by every `gateway.invoke` call
+- 5-second safety buffer prevents disconnect during rapid successive calls
+- Resource monitor can also force-disconnect if RSS exceeds `maxRamMb`
+- Disconnected servers remain searchable — their tool schemas stay in SearchEngine
+
+### Auto-Disconnect: Resource Monitor
+
+For servers with `maxRamMb` set, the resource monitor polls RSS every 10 seconds.
+If a server exceeds the limit, it's force-disconnected regardless of idle time.
+
+### Catalog Snapshots
+
+When a server connects (eagerly or on-demand), its tool schemas are saved to disk:
+
+```
+~/.cache/harshal-mcp-proxy/catalogs/
+├── repeato-backend-mcp-server.json   # 51 tools
+├── neo4j-cypher.json                 # 3 tools
+├── playwright.json                   # 23 tools
+├── ...
+```
+
+These snapshots are loaded at startup so the SearchEngine knows every tool without
+spawning a single process. They're refreshed each time a server reconnects.
+
+### CLI Reference
+
+| Flag | Purpose |
+|------|---------|
+| `(none)` | Stdio mode — config-driven lazy loading |
+| `--daemon` | HTTP daemon mode — config-driven lazy loading |
+| `--port <N>` | HTTP daemon on custom port |
+| `--discover` | Force-connect ALL servers, build snapshots, exit |
 
 ---
 
@@ -467,20 +697,26 @@ Environment variable substitution (`{env:VAR_NAME}`) is supported in environment
 ```
 harshal-mcp-proxy/
 ├── src/
-│   ├── index.ts           # Entry point — stdio or HTTP daemon mode
-│   ├── gateway.ts         # Orchestrator — wires everything together
-│   ├── http-server.ts     # HTTP daemon — JSON-RPC 2.0 over HTTP POST
-│   ├── handlers.ts        # 6 gateway tool registrations
-│   ├── connections.ts     # Upstream MCP server connections
-│   ├── search.ts          # BM25 search engine (MiniSearch)
-│   ├── response-store.ts  # ResponseStore + ResponseShield
-│   ├── jobs.ts            # Async job queue
-│   ├── config.ts          # Config loader + file watcher
-│   └── types.ts           # All TypeScript interfaces
+│   ├── index.ts              # Entry point — stdio, HTTP daemon, or --discover
+│   ├── gateway.ts            # Orchestrator — wires everything together
+│   ├── http-server.ts        # HTTP daemon — JSON-RPC 2.0 over HTTP POST
+│   ├── handlers.ts           # 6 gateway tool registrations
+│   ├── connections.ts        # Upstream MCP server connections + lazy loading
+│   ├── search.ts             # BM25 search engine (MiniSearch)
+│   ├── response-store.ts     # ResponseStore + ResponseShield
+│   ├── jobs.ts               # Async job queue
+│   ├── config.ts             # Config loader + file watcher
+│   ├── types.ts              # All TypeScript interfaces
+│   ├── connection-state.ts   # Connection state machine helpers
+│   ├── lazy-config.ts        # Lazy config normalization + defaults
+│   ├── catalog-snapshot.ts   # Disk-based tool schema snapshots
+│   └── resource-monitor.ts   # PID discovery + RSS polling
 ├── dist/                  # Compiled JS output
 ├── harshal-mcp-proxy.service  # Systemd user service unit
 ├── config.json            # Default upstream server config
 ├── README.md              # This file
+├── AGENT-CONTEXT.md       # Teach any LLM how to call the gateway
+├── SETUP_PROMPT.md        # AI-pasteable setup instructions
 ├── package.json
 └── tsconfig.json
 ```
@@ -500,4 +736,8 @@ harshal-mcp-proxy/
 | Text search in stored results | ❌ | ✅ (ripgrep) | ✅ (in-memory) |
 | Multi-client HTTP daemon mode | ❌ | ❌ | ✅ |
 | Systemd service integration | ❌ | ❌ | ✅ |
+| On-demand lazy loading | ❌ | ❌ | ✅ |
+| Catalog snapshots (disk cache) | ❌ | ❌ | ✅ |
+| Idle monitor (auto-disconnect) | ❌ | ❌ | ✅ |
+| CLI snapshot builder (--discover) | ❌ | ❌ | ✅ |
 | Dependencies | SDK + MiniSearch + LRU | Go stdlib | SDK + MiniSearch + Zod |

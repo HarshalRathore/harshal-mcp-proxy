@@ -25,6 +25,8 @@ export declare class SearchEngine {
     addTool(tool: ToolCatalogEntry): void;
     /** Remove a tool from the catalog. Marks index dirty. */
     removeTool(id: string): void;
+    /** Remove all tools belonging to a specific server (used when server removed from config) */
+    removeServerTools(serverKey: string): void;
     /** Get all catalog entries (used for counting, filtering by server, etc.) */
     getTools(): ToolCatalogEntry[];
     /** Get a single catalog entry by composite ID */

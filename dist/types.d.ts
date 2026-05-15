@@ -25,6 +25,8 @@ export interface UpstreamConfig {
     environment?: Record<string, string>;
     /** Set to false to skip this server entirely */
     enabled?: boolean;
+    /** Enable lazy loading (connect on demand) for this server */
+    lazy?: LazyConfig;
 }
 /** Top-level config: server key → upstream config */
 export interface GatewayConfig {
@@ -75,6 +77,8 @@ export interface SearchResult {
     description?: string;
     score: number;
     fieldNames?: string[];
+    /** Whether the upstream server backing this tool is currently connected */
+    connected?: boolean;
 }
 /**
  * A stored full response from an upstream tool invocation.
@@ -113,6 +117,37 @@ export interface SliceMeta {
     offset: number;
     count: number;
     hasMore: boolean;
+}
+export interface LazyConfig {
+    /** Enable lazy loading for this server (default: false) */
+    enabled?: boolean;
+    /** Disconnect after this many ms of no requests (default: 300000 = 5min) */
+    idleTimeoutMs?: number;
+    /** Force disconnect if process RAM exceeds this MB (0 = no limit) */
+    maxRamMb?: number;
+    /** Force restart after this many ms of uptime (0 = no limit) */
+    maxUptimeMs?: number;
+    /** Max time to wait for on-demand connect in ms (default: 30000) */
+    connectionTimeoutMs?: number;
+    /** Connect at startup even if lazy enabled (default: false) */
+    prewarm?: boolean;
+}
+export type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'failed';
+export interface ServerConnectionRecord {
+    state: ConnectionState;
+    lastUsedAt: number;
+    connectedAt: number;
+    requestCount: number;
+    pid?: number;
+}
+export interface ServerStats {
+    name: string;
+    state: ConnectionState;
+    toolCount: number;
+    lastUsedAt: number | null;
+    requestCount: number;
+    ramMb: number | null;
+    uptimeMs: number | null;
 }
 export interface JobRecord {
     id: string;

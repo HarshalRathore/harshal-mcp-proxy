@@ -31,6 +31,7 @@ import { HttpMcpServer } from "./http-server.js";
 // Parse CLI arguments
 let configPath: string | undefined;
 let port: number | undefined;
+let discoverMode = false;
 
 const args = process.argv.slice(2);
 for (let i = 0; i < args.length; i++) {
@@ -38,12 +39,16 @@ for (let i = 0; i < args.length; i++) {
     port = parseInt(args[++i], 10);
   } else if (args[i] === "--daemon") {
     port = 8765;
+  } else if (args[i] === "--discover") {
+    discoverMode = true;
   } else if (!args[i].startsWith("--")) {
     configPath = args[i];
   }
 }
 
-if (port) {
+if (discoverMode) {
+  runDiscovery(configPath);
+} else if (port) {
   // ── HTTP daemon mode ──
   // Start the gateway, connect to all upstream MCP servers,
   // then serve the same 6 gateway tools over HTTP.
@@ -122,6 +127,17 @@ async function startDaemon(configPath?: string, daemonPort?: number): Promise<vo
   // Start the HTTP server
   await httpServer.start();
   console.error(`  [daemon] harshal-mcp-proxy daemon ready on port ${daemonPort}`);
+}
+
+async function runDiscovery(configPath?: string): Promise<void> {
+  const gateway = new MCPGateway(configPath);
+  console.error("  [discover] Running catalog discovery...");
+  await gateway.connectAll(true); // force-connect all servers to build snapshots
+  // Give a moment for snapshots to be written
+  await new Promise((r) => setTimeout(r, 500));
+  await gateway.shutdown();
+  console.error("  [discover] Catalog snapshots saved. Exiting.");
+  process.exit(0);
 }
 
 // Also expose classes for programmatic usage
