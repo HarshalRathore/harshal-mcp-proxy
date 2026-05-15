@@ -18,6 +18,7 @@
     "dist/",
     "README.md",
     "SETUP_PROMPT.md",
+    "AGENT-CONTEXT.md",
     "config.example.json",
     "harshal-mcp-proxy.service",
     "LICENSE"
