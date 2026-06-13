@@ -27,11 +27,26 @@
 
 import { MCPGateway } from "./gateway.js";
 import { HttpMcpServer } from "./http-server.js";
+function printUsage(): void {
+  console.log(`harshal-mcp-proxy — MCP gateway with schema deferral + response shielding
+
+Usage:
+  node dist/index.js [path-to-config.json]                 (stdio mode, default)
+  node dist/index.js --port 8765 [path-to-config.json]     (HTTP daemon mode)
+  node dist/index.js --daemon [path-to-config.json]        (alias for --port 8765)
+  node dist/index.js --discover                            (build catalog snapshots)
+  node dist/index.js --help | -h                           (show this help)
+
+If no config path is provided, reads from:
+  1. MCP_GATEWAY_CONFIG env var
+  2. ~/.config/harshal-mcp-proxy/config.json`);
+}
 
 // Parse CLI arguments
 let configPath: string | undefined;
 let port: number | undefined;
 let discoverMode = false;
+let showHelp = false;
 
 const args = process.argv.slice(2);
 for (let i = 0; i < args.length; i++) {
@@ -41,9 +56,16 @@ for (let i = 0; i < args.length; i++) {
     port = 8765;
   } else if (args[i] === "--discover") {
     discoverMode = true;
+  } else if (args[i] === "--help" || args[i] === "-h") {
+    showHelp = true;
   } else if (!args[i].startsWith("--")) {
     configPath = args[i];
   }
+}
+
+if (showHelp) {
+  printUsage();
+  process.exit(0);
 }
 
 if (discoverMode) {
