@@ -1,9 +1,11 @@
 # harshal-mcp-proxy
 
-Custom MCP gateway that sits between your AI clients (pi, VS Code, opencode) and your
-upstream MCP servers. Combines **schema deferral** (from
-[mcp-gateway](https://github.com/eznix86/mcp-gateway)) with **response shielding**
-(from [tldr](https://github.com/robinojw/tldr)) in a single TypeScript server.
+Custom MCP gateway that slashes costs: load **6 gateway tools** (~375 tokens) instead
+of 40-70K tokens of upstream MCP server schemas — a ~99.3% reduction — and run **one
+shared daemon** instead of a server farm per agent session, saving ~2.7 GB RAM.
+Combines **schema deferral** (from [mcp-gateway](https://github.com/eznix86/mcp-gateway))
+with **response shielding** (from [tldr](https://github.com/robinojw/tldr)) in a single
+TypeScript server.
 
 ## What it does
 
