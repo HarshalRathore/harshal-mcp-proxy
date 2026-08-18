@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/harshalrathore-harshal-mcp-proxy-badge.png)](https://mseep.ai/app/harshalrathore-harshal-mcp-proxy)
+
 # harshal-mcp-proxy
 
 Custom MCP gateway that slashes costs: load **6 gateway tools** (~375 tokens) instead
