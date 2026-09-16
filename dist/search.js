@@ -11,67 +11,45 @@
  * and only gets back IDs + descriptions, never full JSON Schemas.
  */
 import MiniSearch from "minisearch";
+import { isPlainObject } from "./util.js";
+/** "run_cypher" → "runCypher" */
 function toCamelCase(str) {
     return str.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
 }
+/** Top-level parameter names from a JSON Schema (best effort). */
 function extractFieldNames(schema) {
-    if (!schema || typeof schema !== "object")
+    if (!isPlainObject(schema))
         return [];
-    const obj = schema;
-    if (obj.type === "object" && obj.properties && typeof obj.properties === "object") {
-        return Object.keys(obj.properties);
-    }
-    if (typeof obj.shape === "function") {
-        try {
-            const shape = obj.shape();
-            return Object.keys(shape);
-        }
-        catch {
-            return [];
-        }
-    }
-    if (obj.inputSchema && typeof obj.inputSchema === "object") {
-        return extractFieldNames(obj.inputSchema);
-    }
-    return [];
+    const properties = schema["properties"];
+    if (!isPlainObject(properties))
+        return [];
+    return Object.keys(properties);
 }
 export class SearchEngine {
-    /** Full tool catalog keyed by composite ID */
+    /** Full tool catalog keyed by composite ID. fieldNames is precomputed. */
     catalog = new Map();
     /** MiniSearch instance — rebuilt lazily when dirty */
     miniSearch = null;
     /** Dirty flag: set true when catalog changes, triggers rebuild on next search */
     indexDirty = true;
-    /** Cache for describe results — eliminates repeated schema lookups */
-    describeCache = new Map();
-    constructor() { }
     /** Register a tool into the catalog. Marks index dirty. */
     addTool(tool) {
-        this.catalog.set(tool.id, tool);
-        this.indexDirty = true;
-    }
-    /** Remove a tool from the catalog. Marks index dirty. */
-    removeTool(id) {
-        this.catalog.delete(id);
+        this.catalog.set(tool.id, { ...tool, fieldNames: extractFieldNames(tool.inputSchema) });
         this.indexDirty = true;
     }
     /** Remove all tools belonging to a specific server (used when server removed from config) */
     removeServerTools(serverKey) {
-        const toRemove = [];
+        let removed = false;
         for (const [id, tool] of this.catalog) {
             if (tool.server === serverKey) {
-                toRemove.push(id);
+                this.catalog.delete(id);
+                removed = true;
             }
         }
-        for (const id of toRemove) {
-            this.catalog.delete(id);
-            this.describeCache.delete(id);
-        }
-        if (toRemove.length > 0) {
+        if (removed)
             this.indexDirty = true;
-        }
     }
-    /** Get all catalog entries (used for counting, filtering by server, etc.) */
+    /** Get all catalog entries */
     getTools() {
         return Array.from(this.catalog.values());
     }
@@ -79,71 +57,72 @@ export class SearchEngine {
     getTool(id) {
         return this.catalog.get(id);
     }
-    /** Get a catalog entry with caching — use for describe to avoid repeated lookups */
-    getSchema(id) {
-        if (this.describeCache.has(id))
-            return this.describeCache.get(id);
-        const tool = this.catalog.get(id);
-        if (tool)
-            this.describeCache.set(id, tool);
-        return tool;
+    /** Count tools registered for one server */
+    getToolCount(serverKey) {
+        let count = 0;
+        for (const tool of this.catalog.values()) {
+            if (tool.server === serverKey)
+                count++;
+        }
+        return count;
     }
     /**
      * Search the catalog using BM25 scoring.
      *
-     * @param query - Natural language search query
+     * @param query - Natural language search query. Empty = list everything.
      * @param filters - Optional: restrict to a specific server
      * @param limit - Max results to return (capped at 50)
-     * @returns Sorted search results with scores
      */
     search(query, filters = {}, limit = 10) {
-        this.ensureIndex();
-        if (!this.miniSearch || !query.trim()) {
-            // No index or empty query — return all tools (useful for "list everything")
-            if (!query.trim()) {
-                return this.getTools()
-                    .filter((t) => !filters.server || t.server === filters.server)
-                    .slice(0, Math.min(limit, 50))
-                    .map((t) => ({
-                    id: t.id,
-                    server: t.server,
-                    name: t.name,
-                    displayName: toCamelCase(t.name),
-                    fieldNames: extractFieldNames(t.inputSchema),
-                    description: t.description,
-                    score: 0,
-                }));
-            }
-            return [];
-        }
         const maxLimit = Math.min(limit, 50);
-        // Run BM25 search — get up to 100 raw results then filter
-        const results = this.miniSearch.search(query.toLowerCase()).slice(0, 100);
-        return results
-            .filter((result) => {
-            if (filters.server && result.server !== filters.server)
-                return false;
-            return true;
+        const trimmed = query.trim();
+        this.ensureIndex();
+        // No query — return the catalog (useful for "list everything")
+        if (!trimmed) {
+            return this.getTools()
+                .filter((t) => !filters.server || t.server === filters.server)
+                .slice(0, maxLimit)
+                .map((t) => this.toResult(t, 0));
+        }
+        if (!this.miniSearch)
+            return [];
+        // Filter inside MiniSearch so a server filter isn't applied to a top-N slice
+        return this.miniSearch
+            .search(trimmed.toLowerCase(), {
+            filter: (result) => !filters.server || result["server"] === filters.server,
         })
+            .slice(0, maxLimit)
             .map((result) => {
-            const id = result.id;
-            const catalogEntry = this.catalog.get(id);
+            const entry = this.catalog.get(result.id);
+            if (entry)
+                return this.toResult(entry, result.score);
+            // Index/catalog out of sync (shouldn't happen) — surface what we have
+            const name = String(result["name"] ?? "");
             return {
-                id,
-                server: result.server,
-                name: result.name,
-                displayName: toCamelCase(result.name),
-                fieldNames: catalogEntry ? extractFieldNames(catalogEntry.inputSchema) : [],
-                description: result.description,
-                score: result.score || 0,
+                id: result.id,
+                server: String(result["server"] ?? ""),
+                name,
+                displayName: toCamelCase(name),
+                description: typeof result["description"] === "string" ? result["description"] : undefined,
+                fieldNames: [],
+                score: result.score,
             };
-        })
-            .sort((a, b) => b.score - a.score)
-            .slice(0, maxLimit);
+        });
     }
     /** Force an index rebuild now (call after all connections are established) */
     warmup() {
         this.ensureIndex();
+    }
+    toResult(entry, score) {
+        return {
+            id: entry.id,
+            server: entry.server,
+            name: entry.name,
+            displayName: toCamelCase(entry.name),
+            description: entry.description,
+            fieldNames: entry.fieldNames ?? extractFieldNames(entry.inputSchema),
+            score,
+        };
     }
     /**
      * Rebuild the MiniSearch index if dirty.
@@ -156,7 +135,6 @@ export class SearchEngine {
         const tools = Array.from(this.catalog.values());
         if (tools.length === 0) {
             this.miniSearch = null;
-            this.indexDirty = false;
             return;
         }
         this.miniSearch = new MiniSearch({
@@ -172,7 +150,6 @@ export class SearchEngine {
             },
         });
         this.miniSearch.addAll(tools);
-        this.indexDirty = false;
     }
 }
 //# sourceMappingURL=search.js.map

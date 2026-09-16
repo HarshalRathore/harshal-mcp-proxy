@@ -50,7 +50,7 @@ to connect to it like any other MCP server.
 
 ---
 
-## The 6 Gateway Tools
+## The Gateway Tools
 
 These are the ONLY tools your agent sees. All upstream MCP servers are accessed
 through them.
@@ -207,6 +207,16 @@ gateway.get_result(ref: "r3", fields: ["name", "id", "status"])
 gateway.get_result(ref: "r3", search: "error")
 ```
 
+### 7. `gateway.status` — Gateway Health
+
+Returns connected servers with per-server tool counts, total tools, config file
+path, last reload timestamp, pending reload status, and codegraph projects.
+Use this to confirm a config change was picked up without restarting.
+
+```
+gateway.status()
+```
+
 ---
 
 ## The Standard Workflow
@@ -288,7 +298,7 @@ server within the idle window are fast.
 | `ERROR: ...` in response | Tool returned an error | Check the error message and fix your args |
 | Slow first call to a server (5-15s) | Server process spawning | Normal for lazy servers. Subsequent calls are fast. |
 | `Parse error` from gateway | Invalid JSON in args | Double-check your argument JSON |
-| `Method not found` | Wrong tool name | Gateway exposes ONLY 6 tools: `gateway.search`, `gateway.describe`, `gateway.invoke`, `gateway.invoke_async`, `gateway.invoke_status`, `gateway.get_result` |
+| `Method not found` | Wrong tool name | Gateway exposes ONLY 7 tools: `gateway.search`, `gateway.describe`, `gateway.invoke`, `gateway.invoke_async`, `gateway.invoke_status`, `gateway.get_result`, `gateway.status` |
 
 ---
 

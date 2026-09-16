@@ -12,38 +12,33 @@
  */
 import type { ToolCatalogEntry, SearchFilters, SearchResult } from "./types.js";
 export declare class SearchEngine {
-    /** Full tool catalog keyed by composite ID */
+    /** Full tool catalog keyed by composite ID. fieldNames is precomputed. */
     private catalog;
     /** MiniSearch instance — rebuilt lazily when dirty */
     private miniSearch;
     /** Dirty flag: set true when catalog changes, triggers rebuild on next search */
     private indexDirty;
-    /** Cache for describe results — eliminates repeated schema lookups */
-    private describeCache;
-    constructor();
     /** Register a tool into the catalog. Marks index dirty. */
     addTool(tool: ToolCatalogEntry): void;
-    /** Remove a tool from the catalog. Marks index dirty. */
-    removeTool(id: string): void;
     /** Remove all tools belonging to a specific server (used when server removed from config) */
     removeServerTools(serverKey: string): void;
-    /** Get all catalog entries (used for counting, filtering by server, etc.) */
+    /** Get all catalog entries */
     getTools(): ToolCatalogEntry[];
     /** Get a single catalog entry by composite ID */
     getTool(id: string): ToolCatalogEntry | undefined;
-    /** Get a catalog entry with caching — use for describe to avoid repeated lookups */
-    getSchema(id: string): ToolCatalogEntry | undefined;
+    /** Count tools registered for one server */
+    getToolCount(serverKey: string): number;
     /**
      * Search the catalog using BM25 scoring.
      *
-     * @param query - Natural language search query
+     * @param query - Natural language search query. Empty = list everything.
      * @param filters - Optional: restrict to a specific server
      * @param limit - Max results to return (capped at 50)
-     * @returns Sorted search results with scores
      */
     search(query: string, filters?: SearchFilters, limit?: number): SearchResult[];
     /** Force an index rebuild now (call after all connections are established) */
     warmup(): void;
+    private toResult;
     /**
      * Rebuild the MiniSearch index if dirty.
      * This is cheap for <500 tools — typically <10ms.

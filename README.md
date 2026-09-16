@@ -274,11 +274,13 @@ curl http://localhost:8765/health
 # MCP initialize
 curl -X POST http://localhost:8765/mcp \
   -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
 
 # List tools
 curl -X POST http://localhost:8765/mcp \
   -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
   -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}'
 ```
 
@@ -701,18 +703,19 @@ harshal-mcp-proxy/
 ├── src/
 │   ├── index.ts              # Entry point — stdio, HTTP daemon, or --discover
 │   ├── gateway.ts            # Orchestrator — wires everything together
-│   ├── http-server.ts        # HTTP daemon — JSON-RPC 2.0 over HTTP POST
-│   ├── handlers.ts           # 6 gateway tool registrations
+│   ├── http-server.ts        # HTTP daemon — Streamable HTTP (official SDK transport)
+│   ├── handlers.ts           # Gateway tool registrations (MCP-facing schemas)
+│   ├── tools.ts              # Shared tool logic, used by every transport
 │   ├── connections.ts        # Upstream MCP server connections + lazy loading
 │   ├── search.ts             # BM25 search engine (MiniSearch)
 │   ├── response-store.ts     # ResponseStore + ResponseShield
 │   ├── jobs.ts               # Async job queue
-│   ├── config.ts             # Config loader + file watcher
-│   ├── types.ts              # All TypeScript interfaces
-│   ├── connection-state.ts   # Connection state machine helpers
+│   ├── config.ts             # Config loader/validator + file watcher
+│   ├── types.ts              # Shared TypeScript interfaces
 │   ├── lazy-config.ts        # Lazy config normalization + defaults
 │   ├── catalog-snapshot.ts   # Disk-based tool schema snapshots
-│   └── resource-monitor.ts   # PID discovery + RSS polling
+│   ├── resource-monitor.ts   # PID tracking + RSS reads
+│   └── util.ts               # Small shared helpers
 ├── dist/                  # Compiled JS output
 ├── harshal-mcp-proxy.service  # Systemd user service unit
 ├── config.json            # Default upstream server config

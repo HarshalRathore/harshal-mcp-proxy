@@ -9,23 +9,13 @@ import type { ToolCatalogEntry } from "./types.js";
 export interface SnapshotData {
     serverKey: string;
     discoveredAt: string;
-    tools: Array<{
-        id: string;
-        server: string;
-        name: string;
-        title?: string;
-        description?: string;
-        inputSchema?: unknown;
-        outputSchema?: unknown;
-    }>;
+    tools: ToolCatalogEntry[];
 }
 export declare class CatalogSnapshotManager {
     private snapshotDir;
     constructor(snapshotDir?: string);
     private snapshotPath;
-    hasSnapshot(serverKey: string): boolean;
     loadSnapshot(serverKey: string): ToolCatalogEntry[] | null;
     saveSnapshot(serverKey: string, tools: ToolCatalogEntry[]): void;
     removeSnapshot(serverKey: string): void;
-    listSnapshots(): string[];
 }

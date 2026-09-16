@@ -24,71 +24,59 @@
  * └──────────────────────────────────────────────────────────────────────┘
  */
 import type { StoredResponse, ShieldResult, SliceMeta } from "./types.js";
+export interface QueryOptions {
+    /** For arrays: skip N items (default 0). For strings: character offset. */
+    offset?: number;
+    /** For arrays: take N items (default 50, max 50) */
+    limit?: number;
+    /** Pick specific keys from each object in an array */
+    fields?: string[];
+    /** Case-insensitive text filter */
+    search?: string;
+}
+export type QueryResult = {
+    ok: true;
+    data: unknown;
+    meta: SliceMeta;
+} | {
+    ok: false;
+    error: string;
+};
 export declare class ResponseStore {
     /** Map of ref → full stored response */
     private entries;
-    /** Insertion order for LRU eviction */
+    /** Insertion order for eviction */
     private order;
     /** Monotonic counter for generating ref handles */
     private counter;
     /**
-     * Store a full response and return its ref handle.
+     * Store a full response and return its ref handle (e.g. "r1", "r2").
      *
      * @param toolId - Composite tool ID (e.g. "neo4j-cypher::run_cypher_query")
      * @param full - The complete untruncated response
-     * @returns Ref handle like "r1", "r2", etc.
      */
     store(toolId: string, full: unknown): string;
     /** Retrieve a stored response by ref */
     get(ref: string): StoredResponse | undefined;
     /**
      * Query a stored response with pagination, field projection, and text search.
-     *
-     * This is the handler behind gateway.get_result — gives the model
-     * paginated access to large responses without blowing up context.
-     *
-     * @param ref - Ref handle (e.g. "r3")
-     * @param opts.offset - For arrays: skip N items (default 0)
-     * @param opts.limit - For arrays: take N items (default 50, max 50)
-     * @param opts.fields - Pick specific keys from each object in an array
-     * @param opts.search - Text search within the stored result (case-insensitive)
-     * @returns Paginated/filtered slice + metadata
+     * This is the handler behind gateway.get_result.
      */
-    query(ref: string, opts?: {
-        offset?: number;
-        limit?: number;
-        fields?: string[];
-        search?: string;
-    }): {
-        data: unknown;
-        meta: SliceMeta;
-    } | {
-        error: string;
-    };
-    /** Get summary of all stored results (for debugging) */
-    summary(): Record<string, {
-        toolId: string;
-        byteSize: number;
-        timestamp: number;
-    }>;
+    query(ref: string, opts?: QueryOptions): QueryResult;
 }
 export declare class ResponseShield {
     private responseStore;
     constructor(responseStore: ResponseStore);
     /**
      * Shield a raw tool response before returning it to the model.
+     * Applies the truncation rules in order and stores the full version
+     * if any truncation occurred. Called on every gateway.invoke result.
      *
-     * Applies truncation rules and stores the full version if any truncation occurred.
-     * This is called on every gateway.invoke result.
-     *
-     * @param toolId - Composite tool ID for storage
-     * @param raw - The raw response from the upstream MCP server
-     * @returns { shielded: truncated response, ref: "r3" if truncated, wasTruncated: bool }
+     * @returns { shielded: truncated response, ref: "r3" if truncated, wasTruncated }
      */
     shield(toolId: string, raw: unknown): ShieldResult;
     /**
      * Rule 1: Truncate arrays with >MAX_ARRAY_LENGTH items.
-     *
      * Walks the response looking for the "content" array pattern
      * (MCP responses have content: [{type: "text", text: "..."}])
      * and also any nested arrays in parsed JSON text.
@@ -96,12 +84,9 @@ export declare class ResponseShield {
     private truncateArrays;
     /**
      * Rule 2: Smart field stripping for array-of-objects.
-     *
-     * For arrays of objects, detect fields where the average serialized size
-     * exceeds HEAVY_FIELD_THRESHOLD bytes. Strip those fields (except signal fields)
-     * and add an _omitted list so the model knows what was removed.
-     *
-     * This is adapted from tldr's policy.go compactArray() logic.
+     * Detect fields whose average serialized size exceeds HEAVY_FIELD_THRESHOLD
+     * bytes, strip them (except signal fields), and add an _omitted list so the
+     * model knows what was removed. Adapted from tldr's policy.go compactArray().
      */
     private stripHeavyFields;
     /**
@@ -111,10 +96,11 @@ export declare class ResponseShield {
     private truncateStrings;
     /**
      * Rule 4: Enforce MAX_RESPONSE_BYTES total size.
+     * Iteratively shrink the largest structures (content text, top-level
+     * arrays) and guarantee the cap with a hard text cut as a last resort.
      *
-     * If the response is still too large after rules 1-3, we iteratively
-     * shrink: find arrays and remove items from the end, or truncate
-     * the largest string fields further.
+     * Safe to mutate in place: every container reaches this point freshly
+     * built by rules 1-3, so nothing shared with the stored original changes.
      */
     private enforceMaxSize;
 }

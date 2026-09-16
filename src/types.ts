@@ -1,64 +1,19 @@
 /**
- * types.ts — All interfaces for harshal-mcp-proxy.
+ * types.ts — Shared interfaces for harshal-mcp-proxy.
  *
  * ┌─────────────────────────────────────────────────────────────────┐
  * │  Three layers of types:                                        │
- * │  1. Config types — what lives in config.json                   │
- * │  2. Catalog types — the compressed tool index (schema deferral)│
- * │  3. Store types — response shielding + pagination refs         │
+ * │  1. Catalog types — the compressed tool index (schema deferral) │
+ * │  2. Store types — response shielding + pagination refs          │
+ * │  3. Connection/job types — lazy loading + async invocation      │
  * └─────────────────────────────────────────────────────────────────┘
+ *
+ * Config types live next to their runtime schema in config.ts.
+ * This module is a leaf: it must not import from any other module.
  */
 
 // ──────────────────────────────────────────────
-// 1. Configuration
-// ──────────────────────────────────────────────
-
-/**
- * Config for a single upstream MCP server.
- * Mirrors opencode.json MCP block format so you can copy entries directly.
- */
-export interface UpstreamConfig {
-  /** "local" = stdio subprocess, "remote" = HTTP/WebSocket */
-  type: "local" | "remote";
-
-  /** For local: command + args as array, e.g. ["npx", "-y", "some-mcp"] */
-  command?: string[];
-
-  /** For remote: the URL to connect to */
-  url?: string;
-
-  /** For remote: explicit transport override */
-  transport?: "streamable_http" | "websocket";
-
-  /** Environment variables. Supports {env:VAR_NAME} substitution from process.env */
-  environment?: Record<string, string>;
-
-  /** Set to false to skip this server entirely */
-  enabled?: boolean;
-
-  /** Enable lazy loading (connect on demand) for this server */
-  lazy?: LazyConfig;
-}
-
-/** Top-level config: server key → upstream config */
-export interface GatewayConfig {
-  [serverKey: string]: UpstreamConfig;
-}
-
-/** A registered project for codegraph auto-injection */
-export interface CodeGraphProject {
-  name: string;
-  path: string;
-}
-
-/** Config section for codegraph defaults */
-export interface CodeGraphConfig {
-  projects?: CodeGraphProject[];
-  defaultProject?: string;
-}
-
-// ──────────────────────────────────────────────
-// 2. Tool Catalog (schema deferral layer)
+// 1. Tool Catalog (schema deferral layer)
 // ──────────────────────────────────────────────
 
 /**
@@ -87,6 +42,9 @@ export interface ToolCatalogEntry {
 
   /** Full JSON Schema for the tool's output (if provided) */
   outputSchema?: unknown;
+
+  /** Parameter names extracted from inputSchema (computed at index time) */
+  fieldNames?: string[];
 }
 
 /** Filters for search queries */
@@ -104,12 +62,10 @@ export interface SearchResult {
   description?: string;
   score: number;
   fieldNames?: string[];
-  /** Whether the upstream server backing this tool is currently connected */
-  connected?: boolean;
 }
 
 // ──────────────────────────────────────────────
-// 3. Response Store (response shielding layer)
+// 2. Response Store (response shielding layer)
 // ──────────────────────────────────────────────
 
 /**
@@ -128,9 +84,6 @@ export interface StoredResponse {
 
   /** The complete, untruncated response */
   full: unknown;
-
-  /** Whether the response was truncated before returning to the model */
-  truncated: boolean;
 
   /** Byte size of the full serialized response */
   byteSize: number;
@@ -161,23 +114,8 @@ export interface SliceMeta {
 }
 
 // ──────────────────────────────────────────────
-// 5. Lazy Loading Configuration
+// 3. Connections, jobs, and gateway status
 // ──────────────────────────────────────────────
-
-export interface LazyConfig {
-  /** Enable lazy loading for this server (default: false) */
-  enabled?: boolean;
-  /** Disconnect after this many ms of no requests (default: 300000 = 5min) */
-  idleTimeoutMs?: number;
-  /** Force disconnect if process RAM exceeds this MB (0 = no limit) */
-  maxRamMb?: number;
-  /** Force restart after this many ms of uptime (0 = no limit) */
-  maxUptimeMs?: number;
-  /** Max time to wait for on-demand connect in ms (default: 30000) */
-  connectionTimeoutMs?: number;
-  /** Connect at startup even if lazy enabled (default: false) */
-  prewarm?: boolean;
-}
 
 export type ConnectionState = 'disconnected' | 'connecting' | 'connected' | 'failed';
 
@@ -189,25 +127,11 @@ export interface ServerConnectionRecord {
   pid?: number;
 }
 
-export interface ServerStats {
-  name: string;
-  state: ConnectionState;
-  toolCount: number;
-  lastUsedAt: number | null;
-  requestCount: number;
-  ramMb: number | null;
-  uptimeMs: number | null;
-}
-
-// ──────────────────────────────────────────────
-// 4. Job Manager (async invocation)
-// ──────────────────────────────────────────────
-
 export interface JobRecord {
   id: string;
   status: "queued" | "running" | "completed" | "failed";
   toolId: string;
-  args: unknown;
+  args: Record<string, unknown>;
   priority: number;
   createdAt: number;
   startedAt?: number;
@@ -215,4 +139,25 @@ export interface JobRecord {
   result?: unknown;
   error?: string;
   logs: string[];
+}
+
+/** A registered project for codegraph auto-injection */
+export interface CodeGraphProject {
+  name: string;
+  path: string;
+}
+
+/**
+ * Runtime status the gateway exposes to the gateway.status tool.
+ * Callbacks keep the status read cheap and always current.
+ */
+export interface StatusHolder {
+  getConnectedServers: () => string[];
+  getToolCount: (server: string) => number;
+  getTotalTools: () => number;
+  getConfigPath: () => string;
+  getLastReloadTimestamp: () => number;
+  isPendingReload: () => boolean;
+  getProjects: () => CodeGraphProject[];
+  getDefaultProject: () => string | null;
 }

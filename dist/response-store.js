@@ -23,6 +23,7 @@
  * │  tuned for the opencode + Sonnet/Qwen context window.               │
  * └──────────────────────────────────────────────────────────────────────┘
  */
+import { isPlainObject, serialize, tryParseJson } from "./util.js";
 // ──────────────────────────────────────────────
 // Constants — tune these for your token budget
 // ──────────────────────────────────────────────
@@ -31,7 +32,7 @@ const MAX_ARRAY_LENGTH = 50;
 /** Max chars in any single string field before truncation */
 const MAX_STRING_LENGTH = 8192;
 /** Max total serialized size of shielded response (bytes) */
-const MAX_RESPONSE_BYTES = 65536; // 64KB
+const MAX_RESPONSE_BYTES = 65_536; // 64KB
 /** Max stored responses in the ring buffer */
 const MAX_STORED_RESPONSES = 100;
 /** Average byte threshold for detecting "heavy" fields in array objects */
@@ -43,41 +44,36 @@ const SIGNAL_FIELDS = new Set([
     "created_at", "updated_at", "number", "key",
     "message", "description", "summary", "error",
 ]);
-// ──────────────────────────────────────────────
-// ResponseStore — Ring buffer for full responses
-// ──────────────────────────────────────────────
 export class ResponseStore {
     /** Map of ref → full stored response */
     entries = new Map();
-    /** Insertion order for LRU eviction */
+    /** Insertion order for eviction */
     order = [];
     /** Monotonic counter for generating ref handles */
     counter = 0;
     /**
-     * Store a full response and return its ref handle.
+     * Store a full response and return its ref handle (e.g. "r1", "r2").
      *
      * @param toolId - Composite tool ID (e.g. "neo4j-cypher::run_cypher_query")
      * @param full - The complete untruncated response
-     * @returns Ref handle like "r1", "r2", etc.
      */
     store(toolId, full) {
         this.counter++;
         const ref = `r${this.counter}`;
-        const entry = {
+        this.entries.set(ref, {
             ref,
             toolId,
             timestamp: Date.now(),
             full,
-            truncated: true,
-            byteSize: JSON.stringify(full).length,
-        };
-        this.entries.set(ref, entry);
+            byteSize: Buffer.byteLength(serialize(full)),
+        });
         this.order.push(ref);
         // Evict oldest entries if over capacity
         while (this.entries.size > MAX_STORED_RESPONSES) {
             const oldest = this.order.shift();
-            if (oldest)
-                this.entries.delete(oldest);
+            if (oldest === undefined)
+                break;
+            this.entries.delete(oldest);
         }
         return ref;
     }
@@ -87,106 +83,73 @@ export class ResponseStore {
     }
     /**
      * Query a stored response with pagination, field projection, and text search.
-     *
-     * This is the handler behind gateway.get_result — gives the model
-     * paginated access to large responses without blowing up context.
-     *
-     * @param ref - Ref handle (e.g. "r3")
-     * @param opts.offset - For arrays: skip N items (default 0)
-     * @param opts.limit - For arrays: take N items (default 50, max 50)
-     * @param opts.fields - Pick specific keys from each object in an array
-     * @param opts.search - Text search within the stored result (case-insensitive)
-     * @returns Paginated/filtered slice + metadata
+     * This is the handler behind gateway.get_result.
      */
     query(ref, opts = {}) {
         const entry = this.entries.get(ref);
         if (!entry)
-            return { error: `Result ${ref} not found or expired` };
+            return { ok: false, error: `Result ${ref} not found or expired` };
         const offset = opts.offset ?? 0;
         const limit = Math.min(opts.limit ?? 50, 50);
-        // Try to extract an array from the response
         const arr = extractArray(entry.full);
-        if (arr) {
-            let items = arr;
-            // Apply text search filter if provided
-            if (opts.search) {
-                const needle = opts.search.toLowerCase();
-                items = items.filter((item) => JSON.stringify(item).toLowerCase().includes(needle));
-            }
-            const total = items.length;
-            const sliced = items.slice(offset, offset + limit);
-            // Apply field projection if specified
-            let projected = sliced;
-            if (opts.fields && opts.fields.length > 0) {
-                projected = sliced.map((item) => {
-                    if (typeof item === "object" && item !== null && !Array.isArray(item)) {
-                        const obj = {};
-                        for (const field of opts.fields) {
-                            if (field in item) {
-                                obj[field] = item[field];
-                            }
-                        }
-                        return obj;
-                    }
-                    return item;
-                });
-            }
-            return {
-                data: projected,
-                meta: {
-                    ref,
-                    total,
-                    offset,
-                    count: projected.length,
-                    hasMore: offset + limit < total,
-                },
-            };
-        }
-        // Not an array — try string slicing
-        const fullStr = typeof entry.full === "string"
-            ? entry.full
-            : JSON.stringify(entry.full, null, 2);
-        if (opts.search) {
-            // Search within string — return matching lines
-            const lines = fullStr.split("\n");
-            const needle = opts.search.toLowerCase();
-            const matches = lines.filter((line) => line.toLowerCase().includes(needle));
-            return {
-                data: matches.slice(offset, offset + limit).join("\n"),
-                meta: {
-                    ref,
-                    total: matches.length,
-                    offset,
-                    count: Math.min(limit, matches.length - offset),
-                    hasMore: offset + limit < matches.length,
-                },
-            };
-        }
-        // Plain string pagination by character offset
-        const chunk = fullStr.slice(offset, offset + limit * 200); // ~200 chars per "item"
+        return arr ? queryArray(arr, { ref, offset, limit, opts }) : queryText(entry.full, { ref, offset, limit, opts });
+    }
+}
+/** Slice a stored array: filter → paginate → project fields. */
+function queryArray(arr, { ref, offset, limit, opts }) {
+    let items = arr;
+    if (opts.search) {
+        const needle = opts.search.toLowerCase();
+        items = items.filter((item) => serialize(item).toLowerCase().includes(needle));
+    }
+    const total = items.length;
+    const sliced = items.slice(offset, offset + limit);
+    const projected = opts.fields?.length ? projectFields(sliced, opts.fields) : sliced;
+    return {
+        ok: true,
+        data: projected,
+        meta: { ref, total, offset, count: projected.length, hasMore: offset + limit < total },
+    };
+}
+/** Project only the requested keys from each object in the slice. */
+function projectFields(items, fields) {
+    return items.map((item) => {
+        if (!isPlainObject(item))
+            return item;
+        return Object.fromEntries(fields.filter((field) => field in item).map((field) => [field, item[field]]));
+    });
+}
+/** Paginate a non-array response: line search, or character-offset slices. */
+function queryText(full, { ref, offset, limit, opts }) {
+    const text = typeof full === "string" ? full : JSON.stringify(full, null, 2) ?? "";
+    if (opts.search) {
+        const needle = opts.search.toLowerCase();
+        const matches = text.split("\n").filter((line) => line.toLowerCase().includes(needle));
         return {
-            data: chunk,
+            ok: true,
+            data: matches.slice(offset, offset + limit).join("\n"),
             meta: {
                 ref,
-                total: fullStr.length,
+                total: matches.length,
                 offset,
-                count: chunk.length,
-                hasMore: offset + chunk.length < fullStr.length,
+                count: Math.max(0, Math.min(limit, matches.length - offset)),
+                hasMore: offset + limit < matches.length,
             },
         };
     }
-    /** Get summary of all stored results (for debugging) */
-    summary() {
-        const result = {};
-        for (const [ref, entry] of this.entries) {
-            result[ref] = {
-                toolId: entry.toolId,
-                byteSize: entry.byteSize,
-                timestamp: entry.timestamp,
-            };
-        }
-        return result;
-    }
+    // Plain string pagination by character offset (~200 chars per "item")
+    const chunk = text.slice(offset, offset + limit * 200);
+    return {
+        ok: true,
+        data: chunk,
+        meta: {
+            ref,
+            total: text.length,
+            offset,
+            count: chunk.length,
+            hasMore: offset + chunk.length < text.length,
+        },
+    };
 }
 // ──────────────────────────────────────────────
 // ResponseShield — Truncation engine
@@ -198,190 +161,110 @@ export class ResponseShield {
     }
     /**
      * Shield a raw tool response before returning it to the model.
+     * Applies the truncation rules in order and stores the full version
+     * if any truncation occurred. Called on every gateway.invoke result.
      *
-     * Applies truncation rules and stores the full version if any truncation occurred.
-     * This is called on every gateway.invoke result.
-     *
-     * @param toolId - Composite tool ID for storage
-     * @param raw - The raw response from the upstream MCP server
-     * @returns { shielded: truncated response, ref: "r3" if truncated, wasTruncated: bool }
+     * @returns { shielded: truncated response, ref: "r3" if truncated, wasTruncated }
      */
     shield(toolId, raw) {
-        let shielded = deepClone(raw);
-        let wasTruncated = false;
-        // ── Rule 1: Array truncation ──
-        // If the response contains an array >50 items, cap it
-        shielded = this.truncateArrays(shielded, (didTruncate) => {
-            if (didTruncate)
-                wasTruncated = true;
-        });
-        // ── Rule 2: Smart field stripping for array-of-objects ──
-        // Detect "heavy" fields and strip them, keeping signal fields
-        shielded = this.stripHeavyFields(shielded, (didStrip) => {
-            if (didStrip)
-                wasTruncated = true;
-        });
-        // ── Rule 3: String truncation ──
-        // Walk all string fields recursively, truncate any >8192 chars
-        shielded = this.truncateStrings(shielded, (didTruncate) => {
-            if (didTruncate)
-                wasTruncated = true;
-        });
-        // ── Rule 4: Total size cap ──
-        // If the whole thing is still >64KB, iteratively trim
-        const serialized = JSON.stringify(shielded);
-        if (serialized.length > MAX_RESPONSE_BYTES) {
+        const flags = { truncated: false };
+        let shielded = this.truncateArrays(raw, flags);
+        shielded = this.stripHeavyFields(shielded, flags);
+        shielded = this.truncateStrings(shielded, flags);
+        // Rule 4: total size cap (measured, not assumed)
+        if (serializedSize(shielded) > MAX_RESPONSE_BYTES) {
             shielded = this.enforceMaxSize(shielded);
-            wasTruncated = true;
+            flags.truncated = true;
         }
-        // Store full response if any truncation happened
-        let ref = null;
-        if (wasTruncated) {
-            ref = this.responseStore.store(toolId, raw);
-        }
-        return { shielded, ref, wasTruncated };
+        const ref = flags.truncated ? this.responseStore.store(toolId, raw) : null;
+        return { shielded, ref, wasTruncated: flags.truncated };
     }
     /**
      * Rule 1: Truncate arrays with >MAX_ARRAY_LENGTH items.
-     *
      * Walks the response looking for the "content" array pattern
      * (MCP responses have content: [{type: "text", text: "..."}])
      * and also any nested arrays in parsed JSON text.
      */
-    truncateArrays(data, onTruncate) {
+    truncateArrays(data, flags) {
         if (Array.isArray(data)) {
             if (data.length > MAX_ARRAY_LENGTH) {
-                onTruncate(true);
+                flags.truncated = true;
                 const kept = data.slice(0, MAX_ARRAY_LENGTH);
-                return [
-                    ...kept,
-                    {
-                        _truncated: true,
-                        _total: data.length,
-                        _showing: MAX_ARRAY_LENGTH,
-                        _message: `[TRUNCATED: ${data.length - MAX_ARRAY_LENGTH} more items. Use gateway.get_result to paginate]`,
-                    },
-                ];
+                return [...kept, arrayMarker(data.length)];
             }
-            return data.map((item) => this.truncateArrays(item, onTruncate));
+            return data.map((item) => this.truncateArrays(item, flags));
         }
-        if (data && typeof data === "object" && !Array.isArray(data)) {
-            const obj = data;
+        if (isPlainObject(data)) {
             const result = {};
-            for (const [key, value] of Object.entries(obj)) {
-                result[key] = this.truncateArrays(value, onTruncate);
+            for (const [key, value] of Object.entries(data)) {
+                result[key] = this.truncateArrays(value, flags);
             }
             return result;
         }
         // Check if it's a JSON string containing an array
         if (typeof data === "string" && data.length > 1000) {
-            try {
-                const parsed = JSON.parse(data);
-                if (Array.isArray(parsed) && parsed.length > MAX_ARRAY_LENGTH) {
-                    onTruncate(true);
-                    const kept = parsed.slice(0, MAX_ARRAY_LENGTH);
-                    kept.push({
-                        _truncated: true,
-                        _total: parsed.length,
-                        _showing: MAX_ARRAY_LENGTH,
-                        _message: `[TRUNCATED: ${parsed.length - MAX_ARRAY_LENGTH} more items. Use gateway.get_result to paginate]`,
-                    });
-                    return JSON.stringify(kept);
-                }
-            }
-            catch {
-                // Not JSON — leave as-is
+            const parsed = tryParseJson(data);
+            if (Array.isArray(parsed) && parsed.length > MAX_ARRAY_LENGTH) {
+                flags.truncated = true;
+                const kept = parsed.slice(0, MAX_ARRAY_LENGTH);
+                kept.push(arrayMarker(parsed.length));
+                return JSON.stringify(kept);
             }
         }
         return data;
     }
     /**
      * Rule 2: Smart field stripping for array-of-objects.
-     *
-     * For arrays of objects, detect fields where the average serialized size
-     * exceeds HEAVY_FIELD_THRESHOLD bytes. Strip those fields (except signal fields)
-     * and add an _omitted list so the model knows what was removed.
-     *
-     * This is adapted from tldr's policy.go compactArray() logic.
+     * Detect fields whose average serialized size exceeds HEAVY_FIELD_THRESHOLD
+     * bytes, strip them (except signal fields), and add an _omitted list so the
+     * model knows what was removed. Adapted from tldr's policy.go compactArray().
      */
-    stripHeavyFields(data, onStrip) {
-        if (!data || typeof data !== "object")
+    stripHeavyFields(data, flags) {
+        if (!isPlainObject(data) && !Array.isArray(data))
             return data;
-        if (Array.isArray(data) && data.length > 5) {
-            // Check if this is an array of objects
-            const sampleSize = Math.min(data.length, 10);
-            const sample = data.slice(0, sampleSize);
-            if (sample.every((item) => item && typeof item === "object" && !Array.isArray(item))) {
-                // Calculate average field sizes across the sample
-                const fieldSizes = new Map();
-                const fieldCounts = new Map();
-                for (const item of sample) {
-                    const obj = item;
-                    for (const [key, value] of Object.entries(obj)) {
-                        const size = JSON.stringify(value).length;
-                        fieldSizes.set(key, (fieldSizes.get(key) || 0) + size);
-                        fieldCounts.set(key, (fieldCounts.get(key) || 0) + 1);
+        if (Array.isArray(data)) {
+            if (data.length > 5) {
+                const sample = data.slice(0, Math.min(data.length, 10));
+                if (sample.every(isPlainObject)) {
+                    const heavyFields = findHeavyFields(sample);
+                    if (heavyFields.length > 0) {
+                        flags.truncated = true;
+                        return data.map((item) => {
+                            if (!isPlainObject(item))
+                                return item;
+                            const kept = Object.fromEntries(Object.entries(item).filter(([key]) => !heavyFields.includes(key)));
+                            return { ...kept, _omitted: heavyFields };
+                        });
                     }
                 }
-                // Find heavy fields to strip
-                const heavyFields = [];
-                for (const [field, totalSize] of fieldSizes) {
-                    const count = fieldCounts.get(field) || 1;
-                    const avg = totalSize / count;
-                    if (avg > HEAVY_FIELD_THRESHOLD && !SIGNAL_FIELDS.has(field)) {
-                        heavyFields.push(field);
-                    }
-                }
-                if (heavyFields.length > 0) {
-                    onStrip(true);
-                    return data.map((item) => {
-                        if (item && typeof item === "object" && !Array.isArray(item)) {
-                            const obj = item;
-                            const stripped = {};
-                            for (const [key, value] of Object.entries(obj)) {
-                                if (!heavyFields.includes(key)) {
-                                    stripped[key] = value;
-                                }
-                            }
-                            stripped._omitted = heavyFields;
-                            return stripped;
-                        }
-                        return item;
-                    });
-                }
             }
+            return data;
         }
-        // Recurse into object fields
-        if (!Array.isArray(data)) {
-            const obj = data;
-            const result = {};
-            for (const [key, value] of Object.entries(obj)) {
-                result[key] = this.stripHeavyFields(value, onStrip);
-            }
-            return result;
+        const result = {};
+        for (const [key, value] of Object.entries(data)) {
+            result[key] = this.stripHeavyFields(value, flags);
         }
-        return data;
+        return result;
     }
     /**
      * Rule 3: Truncate any string field exceeding MAX_STRING_LENGTH chars.
      * Walks the entire response recursively.
      */
-    truncateStrings(data, onTruncate) {
+    truncateStrings(data, flags) {
         if (typeof data === "string") {
             if (data.length > MAX_STRING_LENGTH) {
-                onTruncate(true);
+                flags.truncated = true;
                 return data.slice(0, MAX_STRING_LENGTH) + `\n[...TRUNCATED: ${data.length - MAX_STRING_LENGTH} more chars]`;
             }
             return data;
         }
         if (Array.isArray(data)) {
-            return data.map((item) => this.truncateStrings(item, onTruncate));
+            return data.map((item) => this.truncateStrings(item, flags));
         }
-        if (data && typeof data === "object") {
-            const obj = data;
+        if (isPlainObject(data)) {
             const result = {};
-            for (const [key, value] of Object.entries(obj)) {
-                result[key] = this.truncateStrings(value, onTruncate);
+            for (const [key, value] of Object.entries(data)) {
+                result[key] = this.truncateStrings(value, flags);
             }
             return result;
         }
@@ -389,101 +272,135 @@ export class ResponseShield {
     }
     /**
      * Rule 4: Enforce MAX_RESPONSE_BYTES total size.
+     * Iteratively shrink the largest structures (content text, top-level
+     * arrays) and guarantee the cap with a hard text cut as a last resort.
      *
-     * If the response is still too large after rules 1-3, we iteratively
-     * shrink: find arrays and remove items from the end, or truncate
-     * the largest string fields further.
+     * Safe to mutate in place: every container reaches this point freshly
+     * built by rules 1-3, so nothing shared with the stored original changes.
      */
     enforceMaxSize(data) {
-        let current = deepClone(data);
-        let iterations = 0;
-        const maxIterations = 20; // Safety valve
-        while (JSON.stringify(current).length > MAX_RESPONSE_BYTES && iterations < maxIterations) {
-            iterations++;
-            // Strategy: find the largest content and shrink it
-            if (typeof current === "object" && current !== null) {
-                const obj = current;
-                // Look for the MCP content array pattern
-                if (Array.isArray(obj.content)) {
-                    for (let i = 0; i < obj.content.length; i++) {
-                        const item = obj.content[i];
-                        if (item && typeof item.text === "string" && item.text.length > 2000) {
-                            // Halve the text
-                            const text = item.text;
-                            item.text = text.slice(0, Math.floor(text.length / 2)) +
-                                `\n[...TRUNCATED to fit 64KB limit]`;
-                        }
-                    }
-                }
-                // Also try to shrink any top-level arrays
-                for (const [key, value] of Object.entries(obj)) {
-                    if (Array.isArray(value) && value.length > 10) {
-                        const halfLen = Math.floor(value.length * 0.75);
-                        obj[key] = [
-                            ...value.slice(0, halfLen),
-                            {
-                                _truncated: true,
-                                _dropped: value.length - halfLen,
-                                _message: "[Dropped items to fit 64KB response limit. Use gateway.get_result to paginate]",
-                            },
-                        ];
-                    }
-                }
+        let current = data;
+        for (let iteration = 0; iteration < 20 && serializedSize(current) > MAX_RESPONSE_BYTES; iteration++) {
+            if (typeof current === "string") {
+                current = current.slice(0, MAX_RESPONSE_BYTES - 100) + `\n[...TRUNCATED to fit 64KB limit]`;
+                continue;
             }
-            // If it's just a huge string at top level
-            if (typeof current === "string" && current.length > MAX_RESPONSE_BYTES) {
-                current = current.slice(0, MAX_RESPONSE_BYTES - 100) +
-                    `\n[...TRUNCATED to fit 64KB limit]`;
+            if (isPlainObject(current)) {
+                shrinkContentText(current);
+                shrinkLargeArrays(current);
             }
+        }
+        // Guarantee: heuristics can stall (deeply nested objects, no arrays).
+        const serialized = serialize(current);
+        if (Buffer.byteLength(serialized) > MAX_RESPONSE_BYTES) {
+            return serialized.slice(0, MAX_RESPONSE_BYTES) + `\n[...TRUNCATED to fit 64KB limit]`;
         }
         return current;
     }
 }
 // ──────────────────────────────────────────────
-// Helper functions
+// Helpers
 // ──────────────────────────────────────────────
-/** Deep clone via JSON round-trip (sufficient for JSON-serializable MCP responses) */
-function deepClone(data) {
-    return JSON.parse(JSON.stringify(data));
+function serializedSize(value) {
+    return Buffer.byteLength(serialize(value));
+}
+/** Marker item appended to truncated arrays. */
+function arrayMarker(total) {
+    return {
+        _truncated: true,
+        _total: total,
+        _showing: MAX_ARRAY_LENGTH,
+        _message: `[TRUNCATED: ${total - MAX_ARRAY_LENGTH} more items. Use gateway.get_result to paginate]`,
+    };
+}
+/** Fields whose average serialized size exceeds the heavy threshold. */
+function findHeavyFields(sample) {
+    const totalSize = new Map();
+    const counts = new Map();
+    for (const item of sample) {
+        for (const [key, value] of Object.entries(item)) {
+            totalSize.set(key, (totalSize.get(key) ?? 0) + serializedSize(value));
+            counts.set(key, (counts.get(key) ?? 0) + 1);
+        }
+    }
+    const heavy = [];
+    for (const [field, size] of totalSize) {
+        const average = size / (counts.get(field) ?? 1);
+        if (average > HEAVY_FIELD_THRESHOLD && !SIGNAL_FIELDS.has(field))
+            heavy.push(field);
+    }
+    return heavy;
+}
+/** Halve oversized MCP content[].text entries in place. */
+function shrinkContentText(obj) {
+    const content = obj["content"];
+    if (!Array.isArray(content))
+        return;
+    for (const item of content) {
+        if (isPlainObject(item) && typeof item["text"] === "string" && item["text"].length > 2000) {
+            item["text"] = item["text"].slice(0, Math.floor(item["text"].length / 2)) + `\n[...TRUNCATED to fit 64KB limit]`;
+        }
+    }
+}
+/** Drop the tail of large top-level arrays in place. */
+function shrinkLargeArrays(obj) {
+    for (const [key, value] of Object.entries(obj)) {
+        if (Array.isArray(value) && value.length > 10) {
+            const halfLength = Math.floor(value.length * 0.75);
+            obj[key] = [
+                ...value.slice(0, halfLength),
+                {
+                    _truncated: true,
+                    _dropped: value.length - halfLength,
+                    _message: "[Dropped items to fit 64KB response limit. Use gateway.get_result to paginate]",
+                },
+            ];
+        }
+    }
 }
 /**
  * Try to extract an array from various response shapes.
  * MCP responses come in different forms:
  *   - Direct array: [...]
  *   - Content wrapper: { content: [{ type: "text", text: "[...]" }] }
- *   - Nested arrays in text fields
+ *   - Named array fields: { items: [...] }, { results: [...] }, etc.
+ *
+ * The content wrapper is checked first — its text usually holds the
+ * actual data array, which is what pagination should slice.
  */
 function extractArray(data) {
-    // Direct array
     if (Array.isArray(data))
         return data;
-    if (data && typeof data === "object") {
-        const obj = data;
-        // Check common wrapper patterns
-        for (const key of ["content", "items", "data", "results", "entries", "tools"]) {
-            if (Array.isArray(obj[key]))
-                return obj[key];
-        }
-        // MCP content array with text containing JSON array
-        if (Array.isArray(obj.content)) {
-            for (const item of obj.content) {
-                if (item.type === "text" && typeof item.text === "string") {
-                    try {
-                        const parsed = JSON.parse(item.text);
-                        if (Array.isArray(parsed))
-                            return parsed;
-                        // Also check nested arrays in parsed objects
-                        if (parsed && typeof parsed === "object") {
-                            for (const key of ["content", "items", "data", "results"]) {
-                                if (Array.isArray(parsed[key]))
-                                    return parsed[key];
-                            }
-                        }
-                    }
-                    catch {
-                        // Not JSON text — skip
-                    }
-                }
+    if (!isPlainObject(data))
+        return null;
+    // MCP content array whose text contains a JSON array
+    const content = data["content"];
+    if (Array.isArray(content)) {
+        const fromText = arrayFromTextContent(content);
+        if (fromText)
+            return fromText;
+    }
+    // Common wrapper keys
+    for (const key of ["content", "items", "data", "results", "entries", "tools"]) {
+        const value = data[key];
+        if (Array.isArray(value))
+            return value;
+    }
+    return null;
+}
+/** Parse `[{type: "text", text: "<json>"}]` wrappers into the array they hold. */
+function arrayFromTextContent(content) {
+    for (const item of content) {
+        if (!isPlainObject(item) || item["type"] !== "text" || typeof item["text"] !== "string")
+            continue;
+        const parsed = tryParseJson(item["text"]);
+        if (Array.isArray(parsed))
+            return parsed;
+        if (isPlainObject(parsed)) {
+            for (const key of ["items", "data", "results"]) {
+                const value = parsed[key];
+                if (Array.isArray(value))
+                    return value;
             }
         }
     }

@@ -97,8 +97,9 @@ curl http://localhost:8765/health
 
 curl -X POST http://localhost:8765/mcp \
   -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
-# Expected: 6 gateway tools
+# Expected: 7 gateway tools (6 core + gateway.status)
 ```
 
 ### Step 5: Configure pi

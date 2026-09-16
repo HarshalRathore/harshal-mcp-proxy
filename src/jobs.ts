@@ -5,7 +5,6 @@
  * Max 3 concurrent jobs run at once. The model polls via gateway.invoke_status.
  *
  * Jobs are stored in a Map with a max of 200 entries (oldest evicted).
- * No LRU dependency — we use a simple insertion-order eviction.
  */
 
 import type { JobRecord } from "./types.js";
@@ -26,7 +25,7 @@ export class JobManager {
   /** Insertion order for eviction */
   private jobOrder: string[] = [];
 
-  /** Queue of job IDs waiting to run */
+  /** Queue of job IDs waiting to run, highest priority first */
   private queue: string[] = [];
 
   /** Currently running job count */
@@ -34,8 +33,6 @@ export class JobManager {
 
   /** The function that actually executes a job (set by gateway after construction) */
   private executeFn: ((job: JobRecord) => Promise<void>) | null = null;
-
-  constructor() {}
 
   /** Set the job execution function (called by gateway with access to connections) */
   setExecuteJob(fn: (job: JobRecord) => Promise<void>): void {
@@ -48,13 +45,10 @@ export class JobManager {
    * @param toolId - Composite tool ID (e.g. "neo4j-cypher::run_cypher_query")
    * @param args - Arguments to pass to the tool
    * @param priority - Higher priority jobs run first (default 0)
-   * @returns The created job record
    */
-  createJob(toolId: string, args: unknown, priority = 0): JobRecord {
-    const jobId = `job_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
-
+  createJob(toolId: string, args: Record<string, unknown>, priority = 0): JobRecord {
     const job: JobRecord = {
-      id: jobId,
+      id: `job_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`,
       status: "queued",
       toolId,
       args,
@@ -64,21 +58,18 @@ export class JobManager {
     };
 
     // Evict oldest jobs if at capacity
-    while (this.jobs.size >= MAX_JOBS && this.jobOrder.length > 0) {
-      const oldest = this.jobOrder.shift()!;
+    while (this.jobs.size >= MAX_JOBS) {
+      const oldest = this.jobOrder.shift();
+      if (oldest === undefined) break;
       this.jobs.delete(oldest);
     }
 
-    this.jobs.set(jobId, job);
-    this.jobOrder.push(jobId);
+    this.jobs.set(job.id, job);
+    this.jobOrder.push(job.id);
 
     // Insert into queue sorted by priority (descending)
-    this.queue.push(jobId);
-    this.queue.sort((a, b) => {
-      const jobA = this.jobs.get(a);
-      const jobB = this.jobs.get(b);
-      return (jobB?.priority || 0) - (jobA?.priority || 0);
-    });
+    this.queue.push(job.id);
+    this.queue.sort((a, b) => (this.jobs.get(b)?.priority ?? 0) - (this.jobs.get(a)?.priority ?? 0));
 
     return job;
   }
@@ -90,11 +81,13 @@ export class JobManager {
 
   /**
    * Process the queue — start jobs up to MAX_CONCURRENT_JOBS.
-   * Called after createJob and after a job finishes.
+   * Called after createJob and again whenever a job finishes.
    */
   processQueue(): void {
     while (this.runningCount < MAX_CONCURRENT_JOBS && this.queue.length > 0) {
-      const jobId = this.queue.shift()!;
+      const jobId = this.queue.shift();
+      if (jobId === undefined) break;
+
       const job = this.jobs.get(jobId);
       if (!job || !this.executeFn) continue;
 
@@ -107,12 +100,12 @@ export class JobManager {
         .then(() => {
           job.status = "completed";
           job.finishedAt = Date.now();
-          job.logs.push(`Completed in ${job.finishedAt - (job.startedAt || job.createdAt)}ms`);
+          job.logs.push(`Completed in ${job.finishedAt - (job.startedAt ?? job.createdAt)}ms`);
         })
         .catch((err) => {
           job.status = "failed";
           job.finishedAt = Date.now();
-          job.error = (err as Error).message;
+          job.error = err instanceof Error ? err.message : String(err);
           job.logs.push(`Failed: ${job.error}`);
         })
         .finally(() => {
@@ -130,7 +123,7 @@ export class JobManager {
     // Wait for running jobs to finish (with timeout)
     const startTime = Date.now();
     while (this.runningCount > 0 && Date.now() - startTime < SHUTDOWN_TIMEOUT_MS) {
-      await new Promise((r) => setTimeout(r, 500));
+      await new Promise((resolve) => setTimeout(resolve, 500));
     }
 
     if (this.runningCount > 0) {

@@ -13,34 +13,24 @@
 
 import MiniSearch from "minisearch";
 import type { ToolCatalogEntry, SearchFilters, SearchResult } from "./types.js";
+import { isPlainObject } from "./util.js";
 
+/** "run_cypher" → "runCypher" */
 function toCamelCase(str: string): string {
-  return str.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
+  return str.replace(/_([a-z])/g, (_, c: string) => c.toUpperCase());
 }
 
+/** Top-level parameter names from a JSON Schema (best effort). */
 function extractFieldNames(schema: unknown): string[] {
-  if (!schema || typeof schema !== "object") return [];
-  const obj = schema as Record<string, unknown>;
-  if (obj.type === "object" && obj.properties && typeof obj.properties === "object") {
-    return Object.keys(obj.properties as Record<string, unknown>);
-  }
-  if (typeof obj.shape === "function") {
-    try {
-      const shape = (obj.shape as () => Record<string, unknown>)();
-      return Object.keys(shape);
-    } catch {
-      return [];
-    }
-  }
-  if (obj.inputSchema && typeof obj.inputSchema === "object") {
-    return extractFieldNames(obj.inputSchema);
-  }
-  return [];
+  if (!isPlainObject(schema)) return [];
+  const properties = schema["properties"];
+  if (!isPlainObject(properties)) return [];
+  return Object.keys(properties);
 }
 
 export class SearchEngine {
-  /** Full tool catalog keyed by composite ID */
-  private catalog: Map<string, ToolCatalogEntry> = new Map();
+  /** Full tool catalog keyed by composite ID. fieldNames is precomputed. */
+  private catalog = new Map<string, ToolCatalogEntry>();
 
   /** MiniSearch instance — rebuilt lazily when dirty */
   private miniSearch: MiniSearch<ToolCatalogEntry> | null = null;
@@ -48,41 +38,25 @@ export class SearchEngine {
   /** Dirty flag: set true when catalog changes, triggers rebuild on next search */
   private indexDirty = true;
 
-  /** Cache for describe results — eliminates repeated schema lookups */
-  private describeCache: Map<string, ToolCatalogEntry> = new Map();
-
-  constructor() {}
-
   /** Register a tool into the catalog. Marks index dirty. */
   addTool(tool: ToolCatalogEntry): void {
-    this.catalog.set(tool.id, tool);
-    this.indexDirty = true;
-  }
-
-  /** Remove a tool from the catalog. Marks index dirty. */
-  removeTool(id: string): void {
-    this.catalog.delete(id);
+    this.catalog.set(tool.id, { ...tool, fieldNames: extractFieldNames(tool.inputSchema) });
     this.indexDirty = true;
   }
 
   /** Remove all tools belonging to a specific server (used when server removed from config) */
   removeServerTools(serverKey: string): void {
-    const toRemove: string[] = [];
+    let removed = false;
     for (const [id, tool] of this.catalog) {
       if (tool.server === serverKey) {
-        toRemove.push(id);
+        this.catalog.delete(id);
+        removed = true;
       }
     }
-    for (const id of toRemove) {
-      this.catalog.delete(id);
-      this.describeCache.delete(id);
-    }
-    if (toRemove.length > 0) {
-      this.indexDirty = true;
-    }
+    if (removed) this.indexDirty = true;
   }
 
-  /** Get all catalog entries (used for counting, filtering by server, etc.) */
+  /** Get all catalog entries */
   getTools(): ToolCatalogEntry[] {
     return Array.from(this.catalog.values());
   }
@@ -92,74 +66,76 @@ export class SearchEngine {
     return this.catalog.get(id);
   }
 
-  /** Get a catalog entry with caching — use for describe to avoid repeated lookups */
-  getSchema(id: string): ToolCatalogEntry | undefined {
-    if (this.describeCache.has(id)) return this.describeCache.get(id);
-    const tool = this.catalog.get(id);
-    if (tool) this.describeCache.set(id, tool);
-    return tool;
+  /** Count tools registered for one server */
+  getToolCount(serverKey: string): number {
+    let count = 0;
+    for (const tool of this.catalog.values()) {
+      if (tool.server === serverKey) count++;
+    }
+    return count;
   }
 
   /**
    * Search the catalog using BM25 scoring.
    *
-   * @param query - Natural language search query
+   * @param query - Natural language search query. Empty = list everything.
    * @param filters - Optional: restrict to a specific server
    * @param limit - Max results to return (capped at 50)
-   * @returns Sorted search results with scores
    */
   search(query: string, filters: SearchFilters = {}, limit = 10): SearchResult[] {
+    const maxLimit = Math.min(limit, 50);
+    const trimmed = query.trim();
     this.ensureIndex();
 
-    if (!this.miniSearch || !query.trim()) {
-      // No index or empty query — return all tools (useful for "list everything")
-      if (!query.trim()) {
-        return this.getTools()
-          .filter((t) => !filters.server || t.server === filters.server)
-          .slice(0, Math.min(limit, 50))
-          .map((t) => ({
-            id: t.id,
-            server: t.server,
-            name: t.name,
-            displayName: toCamelCase(t.name),
-            fieldNames: extractFieldNames(t.inputSchema),
-            description: t.description,
-            score: 0,
-          }));
-      }
-      return [];
+    // No query — return the catalog (useful for "list everything")
+    if (!trimmed) {
+      return this.getTools()
+        .filter((t) => !filters.server || t.server === filters.server)
+        .slice(0, maxLimit)
+        .map((t) => this.toResult(t, 0));
     }
 
-    const maxLimit = Math.min(limit, 50);
+    if (!this.miniSearch) return [];
 
-    // Run BM25 search — get up to 100 raw results then filter
-    const results = this.miniSearch.search(query.toLowerCase()).slice(0, 100);
-
-    return results
-      .filter((result) => {
-        if (filters.server && result.server !== filters.server) return false;
-        return true;
+    // Filter inside MiniSearch so a server filter isn't applied to a top-N slice
+    return this.miniSearch
+      .search(trimmed.toLowerCase(), {
+        filter: (result) => !filters.server || result["server"] === filters.server,
       })
+      .slice(0, maxLimit)
       .map((result) => {
-        const id = result.id as string;
-        const catalogEntry = this.catalog.get(id);
+        const entry = this.catalog.get(result.id);
+        if (entry) return this.toResult(entry, result.score);
+
+        // Index/catalog out of sync (shouldn't happen) — surface what we have
+        const name = String(result["name"] ?? "");
         return {
-          id,
-          server: result.server as string,
-          name: result.name as string,
-          displayName: toCamelCase(result.name as string),
-          fieldNames: catalogEntry ? extractFieldNames(catalogEntry.inputSchema) : [],
-          description: result.description as string | undefined,
-          score: result.score || 0,
-        };
-      })
-      .sort((a, b) => b.score - a.score)
-      .slice(0, maxLimit);
+          id: result.id,
+          server: String(result["server"] ?? ""),
+          name,
+          displayName: toCamelCase(name),
+          description: typeof result["description"] === "string" ? result["description"] : undefined,
+          fieldNames: [],
+          score: result.score,
+        } satisfies SearchResult;
+      });
   }
 
   /** Force an index rebuild now (call after all connections are established) */
   warmup(): void {
     this.ensureIndex();
+  }
+
+  private toResult(entry: ToolCatalogEntry, score: number): SearchResult {
+    return {
+      id: entry.id,
+      server: entry.server,
+      name: entry.name,
+      displayName: toCamelCase(entry.name),
+      description: entry.description,
+      fieldNames: entry.fieldNames ?? extractFieldNames(entry.inputSchema),
+      score,
+    };
   }
 
   /**
@@ -171,10 +147,8 @@ export class SearchEngine {
     this.indexDirty = false;
 
     const tools = Array.from(this.catalog.values());
-
     if (tools.length === 0) {
       this.miniSearch = null;
-      this.indexDirty = false;
       return;
     }
 
@@ -186,14 +160,13 @@ export class SearchEngine {
       storeFields: ["id", "server", "name", "title", "description"],
 
       searchOptions: {
-        boost: { name: 3, title: 2 },  // Tool name is strongest signal
-        fuzzy: 0.2,                      // Forgive typos
-        prefix: true,                    // Allow prefix matching
-        combineWith: "OR",               // Any term can match
+        boost: { name: 3, title: 2 }, // Tool name is strongest signal
+        fuzzy: 0.2, // Forgive typos
+        prefix: true, // Allow prefix matching
+        combineWith: "OR", // Any term can match
       },
     });
 
     this.miniSearch.addAll(tools);
-    this.indexDirty = false;
   }
 }

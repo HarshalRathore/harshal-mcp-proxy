@@ -6,10 +6,10 @@
  * │                                                                  │
  * │  1. Load config from disk                                        │
  * │  2. Create SearchEngine, JobManager, ResponseStore, Shield       │
- * │  3. Create McpServer with 6 gateway tools                        │
+ * │  3. Create McpServer with the gateway tools                      │
  * │  4. Start StdioServerTransport (so opencode can talk to us)      │
  * │  5. Print __MCP_GATEWAY_STDIO_READY__ (opencode waits for this)  │
- * │  6. Connect to all upstream servers in background                 │
+ * │  6. Connect to all upstream servers in background                │
  * │  7. Watch config file for changes (hot reload)                   │
  * └──────────────────────────────────────────────────────────────────┘
  *
@@ -19,7 +19,8 @@
  */
 
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import type { GatewayConfig } from "./types.js";
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { GatewayConfig, UpstreamConfig } from "./config.js";
 import { Config } from "./config.js";
 import { SearchEngine } from "./search.js";
 import { JobManager } from "./jobs.js";
@@ -30,60 +31,76 @@ import { ProjectRegistry } from "./projectRegistry.js";
 import { normalizeLazyConfig } from "./lazy-config.js";
 import { CatalogSnapshotManager } from "./catalog-snapshot.js";
 import { ResourceMonitor } from "./resource-monitor.js";
+import type { SharedServices, GatewayTools } from "./tools.js";
+import { GatewayTools as Tools } from "./tools.js";
+import type { JobRecord, StatusHolder } from "./types.js";
+import { errorMessage, isPlainObject } from "./util.js";
+
+/** Debounce window for config reloads (rapid saves collapse into one apply). */
+const RELOAD_DEBOUNCE_MS = 1000;
+
+/** Interval between lazy-server limit checks. */
+const IDLE_CHECK_INTERVAL_MS = 30_000;
 
 export class MCPGateway {
   private config: Config;
-  private searchEngine: SearchEngine;
-  private jobManager: JobManager;
+  private searchEngine = new SearchEngine();
+  private jobManager = new JobManager();
   private connections: ConnectionManager;
-  private responseStore: ResponseStore;
+  private responseStore = new ResponseStore();
   private responseShield: ResponseShield;
   private projectRegistry: ProjectRegistry;
-  private snapshotManager: CatalogSnapshotManager;
-  private resourceMonitor: ResourceMonitor;
-  private statusHolder: import("./handlers.js").StatusHolder;
-  private lastReloadTimestamp: number = Date.now();
-  private pendingReload: boolean = false;
-  private lazyMode: boolean;
-  private server: ReturnType<typeof createServer>;
+  private snapshotManager = new CatalogSnapshotManager();
+  private resourceMonitor = new ResourceMonitor();
+  private services: SharedServices;
+  private tools: GatewayTools;
+  private server: McpServer;
+  private lastReloadTimestamp = Date.now();
+  private pendingReload = false;
+  private reloadTimer?: ReturnType<typeof setTimeout>;
 
-  constructor(configPath?: string, lazyMode?: boolean) {
-    this.lazyMode = lazyMode || false;
-    // Initialize all subsystems
+  constructor(configPath?: string) {
     this.config = new Config(configPath);
-    this.searchEngine = new SearchEngine();
-    this.jobManager = new JobManager();
-    this.connections = new ConnectionManager(this.searchEngine);
-    this.snapshotManager = new CatalogSnapshotManager();
-    this.resourceMonitor = new ResourceMonitor();
 
-    // Wire lazy-loading dependencies into ConnectionManager
-    this.connections.setConfigProvider(() => this.config.getAll());
+    this.connections = new ConnectionManager(this.searchEngine);
+    this.connections.setConfigProvider(() => this.config.getServers());
     this.connections.setSnapshotManager(this.snapshotManager);
     this.connections.setResourceMonitor(this.resourceMonitor);
 
-    this.responseStore = new ResponseStore();
     this.responseShield = new ResponseShield(this.responseStore);
 
-    // Initialize project registry with scan roots from config or env
-    // SCAN_ROOTS env var: comma-separated list of directories to scan for .codegraph/ folders
-    // Default: scan the current working directory
-    const envScanRoots = process.env.SCAN_ROOTS || "";
-    const scanRoots = envScanRoots
-      ? envScanRoots.split(",").map((s) => s.trim()).filter(Boolean)
-      : [process.cwd()];
-    const configCodegraph = this.config.get("codegraph") as { projects?: Array<{ name: string; path: string }>; defaultProject?: string } | undefined;
-    const explicitProjects = configCodegraph?.projects || [];
-    const allScanRoots = [...scanRoots, ...explicitProjects.map((p) => p.path)];
+    this.projectRegistry = new ProjectRegistry(this.resolveScanRoots());
+    this.projectRegistry.discover(this.config.getCodegraph().defaultProject);
 
-    this.projectRegistry = new ProjectRegistry(allScanRoots);
-    const configDefault = configCodegraph?.defaultProject;
-    this.projectRegistry.discover(configDefault);
+    this.services = {
+      searchEngine: this.searchEngine,
+      connections: this.connections,
+      jobManager: this.jobManager,
+      responseStore: this.responseStore,
+      responseShield: this.responseShield,
+      projectRegistry: this.projectRegistry,
+      statusHolder: this.buildStatusHolder(),
+    };
 
-    // Create the MCP server with all gateway tools, passing projectRegistry + status
-    const statusHolder: import("./handlers.js").StatusHolder = {
+    this.tools = new Tools(this.services);
+    this.server = createServer(this.services);
+    this.jobManager.setExecuteJob((job) => this.executeJob(job));
+  }
+
+  /** Scan roots for codegraph discovery: SCAN_ROOTS env, then cwd, plus configured projects. */
+  private resolveScanRoots(): string[] {
+    const envRoots = (process.env.SCAN_ROOTS ?? "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const configured = this.config.getCodegraph().projects?.map((p) => p.path) ?? [];
+    return [...(envRoots.length > 0 ? envRoots : [process.cwd()]), ...configured];
+  }
+
+  private buildStatusHolder(): StatusHolder {
+    return {
       getConnectedServers: () => this.connections.getConnectedServers(),
-      getToolCount: (server) => this.searchEngine.getTools().filter((t) => t.server === server).length,
+      getToolCount: (server) => this.searchEngine.getToolCount(server),
       getTotalTools: () => this.searchEngine.getTools().length,
       getConfigPath: () => this.config.getPath(),
       getLastReloadTimestamp: () => this.lastReloadTimestamp,
@@ -91,58 +108,12 @@ export class MCPGateway {
       getProjects: () => this.projectRegistry.projectsList,
       getDefaultProject: () => this.projectRegistry.defaultProjectName,
     };
-
-    this.statusHolder = statusHolder;
-
-    this.server = createServer(
-      this.searchEngine,
-      this.connections,
-      this.jobManager,
-      this.responseStore,
-      this.responseShield,
-      this.projectRegistry,
-      statusHolder
-    );
-
-    // Wire up the job manager's execute function
-    this.jobManager.setExecuteJob(async (job) => {
-      const separatorIndex = job.toolId.toString().indexOf("::");
-      if (separatorIndex === -1) {
-        throw new Error(`Invalid tool ID: ${job.toolId}`);
-      }
-
-      const serverKey = job.toolId.toString().slice(0, separatorIndex);
-      const toolName = job.toolId.toString().slice(separatorIndex + 2);
-
-      // On-demand connect for lazy servers
-      const client = await this.connections.ensureConnected(serverKey);
-      this.connections.markServerUsed(serverKey);
-
-      // Auto-inject projectPath for codegraph tools
-      let finalArgs = job.args as Record<string, unknown>;
-      if (serverKey === "codegraph" && finalArgs) {
-        finalArgs = this.injectProjectPath(finalArgs);
-      }
-
-      const result = await client.callTool({
-        name: toolName,
-        arguments: finalArgs,
-      });
-
-      // Shield the async result too
-      const { shielded, ref } = this.responseShield.shield(job.toolId.toString(), result);
-      job.result = ref ? { ...shielded as object, _ref: ref } : shielded;
-    });
   }
 
-  /** Auto-inject projectPath for codegraph tools if not provided */
-  private injectProjectPath(args: Record<string, unknown>): Record<string, unknown> {
-    if ("projectPath" in args) return args;
-    const resolved = this.projectRegistry.resolveProjectPath();
-    if (resolved) {
-      return { ...args, projectPath: resolved };
-    }
-    return args;
+  /** Execute an async job: call the tool, shield the result, keep the ref. */
+  private async executeJob(job: JobRecord): Promise<void> {
+    const { shielded, ref } = await this.tools.callTool({ id: job.toolId, args: job.args });
+    job.result = ref !== null && isPlainObject(shielded) ? { ...shielded, _ref: ref } : shielded;
   }
 
   /**
@@ -154,11 +125,11 @@ export class MCPGateway {
    *   setting (used by --discover to build initial snapshots).
    */
   async connectAll(forceConnect = false): Promise<void> {
-    const allConfig = this.config.getAll();
+    const servers = this.config.getServers();
     const eagerKeys: string[] = [];
     const lazyKeys: string[] = [];
 
-    for (const [serverKey, config] of Object.entries(allConfig)) {
+    for (const [serverKey, config] of Object.entries(servers)) {
       if (config.enabled === false) continue;
       const lazy = normalizeLazyConfig(config.lazy);
       if (!forceConnect && lazy.enabled && !lazy.prewarm) {
@@ -168,27 +139,23 @@ export class MCPGateway {
       }
     }
 
-    // Eager-connect non-lazy servers (existing behavior)
-    const eagerPromises = eagerKeys.map((serverKey) =>
-      this.connections.connectWithRetry(serverKey, allConfig[serverKey]).catch((err) => {
-        console.error(`  [${serverKey}] FAILED: ${(err as Error).message}`);
-      })
+    // Eager-connect non-lazy servers
+    await Promise.allSettled(
+      eagerKeys.map((serverKey) =>
+        this.connections.connectWithRetry(serverKey, servers[serverKey]).catch((err) => {
+          console.error(`  [${serverKey}] FAILED: ${errorMessage(err)}`);
+        })
+      )
     );
-    await Promise.allSettled(eagerPromises);
 
     // For lazy servers: load snapshots without connecting
-    let snapshotLoadedCount = 0;
     for (const serverKey of lazyKeys) {
-      const snapshot = this.snapshotManager.loadSnapshot(serverKey);
-      if (snapshot) {
-        for (const tool of snapshot) {
-          this.searchEngine.addTool(tool);
-        }
-        snapshotLoadedCount += snapshot.length;
-        console.error(`  [${serverKey}] Lazy — loaded ${snapshot.length} tools from snapshot`);
-      } else {
-        console.error(`  [${serverKey}] Lazy — no snapshot, will discover on first use`);
-      }
+      const count = this.loadSnapshotTools(serverKey);
+      console.error(
+        count === undefined
+          ? `  [${serverKey}] Lazy — no snapshot, will discover on first use`
+          : `  [${serverKey}] Lazy — loaded ${count} tools from snapshot`
+      );
     }
 
     // Rebuild search index
@@ -196,28 +163,24 @@ export class MCPGateway {
 
     const toolCount = this.searchEngine.getTools().length;
     const connectedCount = this.connections.getConnectedServers().length;
-    const lazyCount = lazyKeys.length;
     console.error(
-      `  [gateway] Ready: ${toolCount} tools (${connectedCount} connected + ${lazyCount} lazy) from ${Object.keys(allConfig).length} servers`
+      `  [gateway] Ready: ${toolCount} tools (${connectedCount} connected + ${lazyKeys.length} lazy) from ${Object.keys(servers).length} servers`
     );
 
-    // Start idle monitor if any lazy servers exist
-    // (both stdio and daemon modes need this)
-    if (lazyCount > 0) {
-      this.connections.startIdleMonitor(30000);
+    // Start the lazy-server monitor (idle/RAM/uptime limits)
+    if (lazyKeys.length > 0) {
+      this.connections.startIdleMonitor(IDLE_CHECK_INTERVAL_MS);
     }
   }
 
   /**
-   * Start the gateway with stdio transport.
-   * This is the main entry point when used from opencode.
+   * Start the gateway with stdio transport. This is the main entry point
+   * when used from opencode.
    *
    * IMPORTANT: The __MCP_GATEWAY_STDIO_READY__ marker is printed to stdout
    * after the stdio transport is connected. opencode waits for this before
-   * sending any requests.
-   *
-   * Upstream connections happen in the background AFTER stdio is ready,
-   * so the gateway starts fast even if upstream servers are slow.
+   * sending any requests. Upstream connections happen in the background
+   * AFTER stdio is ready, so the gateway starts fast even with slow servers.
    */
   async startWithStdio(): Promise<void> {
     console.error("harshal-mcp-proxy starting (stdio)...");
@@ -229,171 +192,134 @@ export class MCPGateway {
     // This MUST go to stdout (not stderr) — opencode parses it
     console.log("__MCP_GATEWAY_STDIO_READY__");
 
-    // Connect to upstream servers in the background (unless --lazy)
-    if (!this.lazyMode) {
-      this.connectAll().catch((err) => {
-        console.error(`  [gateway] Background connection error: ${(err as Error).message}`);
-      });
-    } else {
-      console.error("  [gateway] Lazy mode — skipping background connect, servers will connect on demand");
-    }
+    // Connect to upstream servers in the background
+    this.connectAll().catch((err) => {
+      console.error(`  [gateway] Background connection error: ${errorMessage(err)}`);
+    });
 
-    // Start idle monitor for lazy servers
-    this.connections.startIdleMonitor(30000);
+    // Watch for lazy-server limits
+    this.connections.startIdleMonitor(IDLE_CHECK_INTERVAL_MS);
 
     // Watch config file for hot-reload
     this.config.watch((oldCfg, newCfg) => this.handleConfigChange(oldCfg, newCfg));
   }
 
+  /** Load a server's snapshot into the search index. Returns tool count, or undefined when none. */
+  private loadSnapshotTools(serverKey: string): number | undefined {
+    const snapshot = this.snapshotManager.loadSnapshot(serverKey);
+    if (!snapshot) return undefined;
+    for (const tool of snapshot) this.searchEngine.addTool(tool);
+    return snapshot.length;
+  }
+
+  // ──────────────────────────────────────────────
+  // Config hot reload
+  // ──────────────────────────────────────────────
+
   /**
-   * Handle config file changes — reconnect modified servers, add new ones, remove deleted ones.
-   * Uses a 1-second debounce to avoid thrashing on rapid saves.
+   * Handle config file changes — reconnect modified servers, add new ones,
+   * remove deleted ones. Rapid saves collapse into one reload (debounced).
    */
   private handleConfigChange(oldConfig: GatewayConfig, newConfig: GatewayConfig): void {
     this.pendingReload = true;
     console.error("  [gateway] Config change detected, reloading...");
 
+    clearTimeout(this.reloadTimer);
+    this.reloadTimer = setTimeout(() => void this.applyConfigChange(oldConfig, newConfig), RELOAD_DEBOUNCE_MS);
+  }
+
+  private async applyConfigChange(oldConfig: GatewayConfig, newConfig: GatewayConfig): Promise<void> {
     const oldKeys = new Set(Object.keys(oldConfig));
-    const newKeys = new Set(Object.keys(newConfig));
 
-    const toRemove = [...oldKeys].filter((k) => !newKeys.has(k));
-    const toAdd = [...newKeys].filter((k) => !oldKeys.has(k));
-    const toCheck = [...newKeys].filter((k) => oldKeys.has(k));
-
-    // Debounce the actual reload
-    setTimeout(async () => {
-      // Remove deleted servers
-      for (const key of toRemove) {
-        await this.connections.removeServer(key);
-        console.error(`    ${key} — removed from config`);
+    try {
+      for (const key of oldKeys) {
+        if (!(key in newConfig)) await this.removeServer(key, "removed from config");
       }
 
-      // Check for changes in existing servers
-      for (const key of toCheck) {
-        const oldC = oldConfig[key];
-        const newC = newConfig[key];
-
-        // Disabled → still disabled: skip
-        if (oldC?.enabled === false && newC?.enabled === false) continue;
-
-        // Was enabled → now disabled: disconnect
-        if (oldC?.enabled !== false && newC?.enabled === false) {
-          await this.connections.removeServer(key);
-          console.error(`    ${key} — disabled`);
-          continue;
-        }
-
-        // Was disabled → now enabled: connect
-        if (oldC?.enabled === false && newC?.enabled !== false) {
-          const lazy = normalizeLazyConfig(newC.lazy);
-          if (lazy.enabled && !lazy.prewarm) {
-            // Lazy server: load snapshot if available
-            const snapshot = this.snapshotManager.loadSnapshot(key);
-            if (snapshot) {
-              for (const tool of snapshot) {
-                this.searchEngine.addTool(tool);
-              }
-              console.error(`    ${key} — enabled (lazy, loaded ${snapshot.length} tools from snapshot)`);
-            } else {
-              console.error(`    ${key} — enabled (lazy, no snapshot yet)`);
-            }
-          } else {
-            try {
-              await this.connections.connectWithRetry(key, newC);
-              console.error(`    ${key} — enabled`);
-            } catch (e) {
-              console.error(`    ${key} — failed: ${(e as Error).message}`);
-            }
-          }
-          continue;
-        }
-
-        // Both enabled — check for config changes
-        if (JSON.stringify(oldC) !== JSON.stringify(newC)) {
-          await this.connections.disconnect(key);
-          const lazy = normalizeLazyConfig(newC.lazy);
-          if (lazy.enabled && !lazy.prewarm) {
-            // Reconnect to refresh snapshot, then immediately disconnect
-            try {
-              await this.connections.connectWithRetry(key, newC);
-              await this.connections.disconnect(key);
-              console.error(`    ${key} — snapshot refreshed (lazy)`);
-            } catch (e) {
-              console.error(`    ${key} — refresh failed: ${(e as Error).message}`);
-            }
-          } else {
-            try {
-              await this.connections.connectWithRetry(key, newC);
-              console.error(`    ${key} — reconnected (config changed)`);
-            } catch (e) {
-              console.error(`    ${key} — reconnect failed: ${(e as Error).message}`);
-            }
-          }
-        }
+      for (const [key, config] of Object.entries(newConfig)) {
+        if (key in oldConfig) await this.syncServer(key, oldConfig[key], config);
+        else await this.connectOrSnapshot(key, config, "connected (new)");
       }
-
-      // Add new servers
-      for (const key of toAdd) {
-        const config = newConfig[key];
-        if (config?.enabled !== false) {
-          const lazy = normalizeLazyConfig(config.lazy);
-          if (lazy.enabled && !lazy.prewarm) {
-            // Lazy server: just load snapshot if available
-            const snapshot = this.snapshotManager.loadSnapshot(key);
-            if (snapshot) {
-              for (const tool of snapshot) {
-                this.searchEngine.addTool(tool);
-              }
-              console.error(`    ${key} — lazy loaded from snapshot (${snapshot.length} tools)`);
-            } else {
-              console.error(`    ${key} — lazy, no snapshot yet`);
-            }
-          } else {
-            // Eager connect
-            try {
-              await this.connections.connectWithRetry(key, config);
-              console.error(`    ${key} — connected (new)`);
-            } catch (e) {
-              console.error(`    ${key} — failed: ${(e as Error).message}`);
-            }
-          }
-        }
-      }
-
+    } finally {
       this.searchEngine.warmup();
       this.pendingReload = false;
       this.lastReloadTimestamp = Date.now();
       console.error(
         `  [gateway] Reloaded: ${this.searchEngine.getTools().length} tools from ${this.connections.getConnectedServers().length} servers`
       );
-    }, 1000);
+    }
   }
+
+  /** Reconcile one server that exists in both old and new config. */
+  private async syncServer(serverKey: string, oldConfig: UpstreamConfig, newConfig: UpstreamConfig): Promise<void> {
+    const wasEnabled = oldConfig.enabled !== false;
+    const nowEnabled = newConfig.enabled !== false;
+
+    if (!wasEnabled && !nowEnabled) return;
+    if (wasEnabled && !nowEnabled) return this.removeServer(serverKey, "disabled");
+    if (!wasEnabled && nowEnabled) return this.connectOrSnapshot(serverKey, newConfig, "enabled");
+    if (JSON.stringify(oldConfig) === JSON.stringify(newConfig)) return;
+
+    // Config changed while enabled — reconnect. Lazy servers refresh their
+    // snapshot and then disconnect again so the catalog stays current.
+    await this.connections.disconnect(serverKey);
+    const lazy = normalizeLazyConfig(newConfig.lazy);
+    try {
+      await this.connections.connectWithRetry(serverKey, newConfig);
+      if (lazy.enabled && !lazy.prewarm) {
+        await this.connections.disconnect(serverKey);
+        console.error(`    ${serverKey} — snapshot refreshed (lazy)`);
+      } else {
+        console.error(`    ${serverKey} — reconnected (config changed)`);
+      }
+    } catch (err) {
+      console.error(`    ${serverKey} — reconnect failed: ${errorMessage(err)}`);
+    }
+  }
+
+  /** Connect a newly enabled server, or load its snapshot when it is lazy. */
+  private async connectOrSnapshot(serverKey: string, config: UpstreamConfig, label: string): Promise<void> {
+    if (config.enabled === false) return;
+
+    const lazy = normalizeLazyConfig(config.lazy);
+    if (lazy.enabled && !lazy.prewarm) {
+      const count = this.loadSnapshotTools(serverKey);
+      console.error(`    ${serverKey} — ${label} (lazy${count === undefined ? ", no snapshot yet" : `, loaded ${count} tools from snapshot`})`);
+      return;
+    }
+
+    try {
+      await this.connections.connectWithRetry(serverKey, config);
+      console.error(`    ${serverKey} — ${label}`);
+    } catch (err) {
+      console.error(`    ${serverKey} — failed: ${errorMessage(err)}`);
+    }
+  }
+
+  private async removeServer(serverKey: string, reason: string): Promise<void> {
+    await this.connections.removeServer(serverKey);
+    console.error(`    ${serverKey} — ${reason}`);
+  }
+
+  // ──────────────────────────────────────────────
+  // Shared services / shutdown
+  // ──────────────────────────────────────────────
 
   /**
    * Share internal services for HTTP daemon mode.
    * The HttpMcpServer reuses the same SearchEngine, ConnectionManager, etc.
    * so that all clients share one set of upstream MCP connections.
    */
-  getSharedServices() {
-    return {
-      searchEngine: this.searchEngine,
-      connections: this.connections,
-      jobManager: this.jobManager,
-      responseStore: this.responseStore,
-      responseShield: this.responseShield,
-      projectRegistry: this.projectRegistry,
-      statusHolder: this.statusHolder,
-      snapshotManager: this.snapshotManager,
-      resourceMonitor: this.resourceMonitor,
-    };
+  getSharedServices(): SharedServices {
+    return this.services;
   }
 
   /** Graceful shutdown — stop watching, drain jobs, disconnect all */
   async shutdown(): Promise<void> {
     console.error("  [gateway] Shutting down...");
+    clearTimeout(this.reloadTimer);
     this.config.stopWatching();
     this.connections.stopIdleMonitor();
-    this.resourceMonitor.stopMonitoring();
     await this.jobManager.shutdown();
     await this.connections.disconnectAll();
     await this.server.close();
